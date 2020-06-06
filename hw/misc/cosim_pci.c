@@ -142,7 +142,7 @@ static volatile union cosim_pcie_proto_h2d *cosim_comm_h2d_alloc(
     pos = cosim->h2d_base + (cosim->h2d_elen * cosim->h2d_pos);
     msg = (volatile union cosim_pcie_proto_h2d *) pos;
 
-    if ((msg->dummy.own_type & COSIM_PCIE_PROTO_H2D_OWN_MASK) ==
+    if ((msg->dummy.own_type & COSIM_PCIE_PROTO_H2D_OWN_MASK) !=
             COSIM_PCIE_PROTO_H2D_OWN_HOST)
     {
         /* this should never happen as we synchronously submit requests
@@ -248,7 +248,7 @@ static void cosim_comm_poll_d2h(CosimPciState *cosim)
     volatile union cosim_pcie_proto_d2h *msg;
 
     while (1) {
-        pos = cosim->h2d_base + (cosim->d2h_elen * cosim->d2h_pos);
+        pos = cosim->d2h_base + (cosim->d2h_elen * cosim->d2h_pos);
         msg = (volatile union cosim_pcie_proto_d2h *) pos;
 
         /* check if this message is ready for us */
