@@ -490,6 +490,7 @@ static int cosim_connect(CosimPciState *cosim, Error **errp)
     struct stat statbuf;
     int ret, off, len;
     void *p;
+    uint8_t *pci_conf = cosim->pdev.config;
 
     if (!qemu_chr_fe_backend_connected(&cosim->sim_chr)) {
         error_setg(errp, "no simulator chardev specified");
@@ -573,6 +574,13 @@ static int cosim_connect(CosimPciState *cosim, Error **errp)
 
     cosim->req.processing = false;
     cosim->req.requested = false;
+
+    /* set vendor, device, revision, and class id */
+    pci_config_set_vendor_id(pci_conf, d_i->pci_vendor_id);
+    pci_config_set_device_id(pci_conf, d_i->pci_device_id);
+    pci_config_set_revision(pci_conf, d_i->pci_revision);
+    pci_config_set_class(pci_conf,
+            ((uint16_t) d_i->pci_class << 8) | d_i->pci_subclass);
 
     return 1;
 }
