@@ -169,9 +169,9 @@ static void cosim_comm_d2h_dma_read(CosimPciState *cosim,
     assert(read->len <= cosim->h2d_elen - sizeof (*rc));
 
     /* perform dma read */
-    qemu_mutex_lock_iothread();
+    //qemu_mutex_lock_iothread();
     pci_dma_read(&cosim->pdev, read->offset, (void *) rc->data, read->len);
-    qemu_mutex_unlock_iothread();
+    //qemu_mutex_unlock_iothread();
 
     /* return completion */
     rc->req_id = read->req_id;
@@ -191,10 +191,10 @@ static void cosim_comm_d2h_dma_write(CosimPciState *cosim,
     wc = &h2d->writecomp;
 
     /* perform dma write */
-    qemu_mutex_lock_iothread();
+    //qemu_mutex_lock_iothread();
     pci_dma_write(&cosim->pdev, write->offset, (void *) write->data,
             write->len);
-    qemu_mutex_unlock_iothread();
+    //qemu_mutex_unlock_iothread();
 
     /* return completion */
     wc->req_id = write->req_id;
