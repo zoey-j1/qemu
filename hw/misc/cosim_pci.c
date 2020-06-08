@@ -592,23 +592,20 @@ static void pci_cosim_realize(PCIDevice *pdev, Error **errp)
     uint64_t len, flags;
     uint8_t attr;
     const char *label;
-
-    /*uint8_t *pci_conf = pdev->config;
-    pci_config_set_interrupt_pin(pci_conf, 1);
-    if (msi_init(pdev, 0, 1, true, false, errp)) {
-        return;
-    }*/
+    uint8_t *pci_conf = pdev->config;
 
     if (!cosim_connect(cosim, errp)) {
       return;
     }
 
-    //timer_init_ms(&cosim->dma_timer, QEMU_CLOCK_VIRTUAL, edu_dma_timer, cosim);
-
-    qemu_mutex_init(&cosim->thr_mutex);
-    qemu_cond_init(&cosim->thr_cond);
-    qemu_thread_create(&cosim->thread, "cosim", cosim_comm_thread,
-                       cosim, QEMU_THREAD_JOINABLE);
+    pci_config_set_interrupt_pin(pci_conf, 1);
+    if (cosim->dev_intro.pci_msi_nvecs > 0) {
+        if (msi_init(pdev, 0, cosim->dev_intro.pci_msi_nvecs, true, false,
+                    errp))
+        {
+            return;
+        }
+    }
 
     for (i = 0; i < 6; i++) {
         len = cosim->dev_intro.bars[i].len;
@@ -645,6 +642,13 @@ static void pci_cosim_realize(PCIDevice *pdev, Error **errp)
                 &cosim_mmio_ops, &cosim->bar_info[i], label, len);
         pci_register_bar(pdev, i, attr, &cosim->mmio_bars[i]);
     }
+
+    //timer_init_ms(&cosim->dma_timer, QEMU_CLOCK_VIRTUAL, edu_dma_timer, cosim);
+
+    qemu_mutex_init(&cosim->thr_mutex);
+    qemu_cond_init(&cosim->thr_cond);
+    qemu_thread_create(&cosim->thread, "cosim", cosim_comm_thread,
+                       cosim, QEMU_THREAD_JOINABLE);
 }
 
 static void pci_cosim_uninit(PCIDevice *pdev)
@@ -659,7 +663,8 @@ static void pci_cosim_uninit(PCIDevice *pdev)
     qemu_cond_destroy(&cosim->thr_cond);
     qemu_mutex_destroy(&cosim->thr_mutex);
 
-    //msi_uninit(pdev);
+    if (cosim->dev_intro.pci_msi_nvecs > 0)
+        msi_uninit(pdev);
 }
 
 static void cosim_pci_instance_init(Object *obj)
