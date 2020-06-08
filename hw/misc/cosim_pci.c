@@ -618,10 +618,11 @@ static void pci_cosim_realize(PCIDevice *pdev, Error **errp)
 
         cosim->bar_info[i].cosim = cosim;
         cosim->bar_info[i].index = i;
-        cosim->bar_info[i].is_io = true;
 
         if (!(flags & COSIM_PCIE_PROTO_BAR_IO)) {
             /* memory bar */
+            cosim->bar_info[i].is_io = false;
+
             attr = PCI_BASE_ADDRESS_SPACE_MEMORY;
             if ((flags & COSIM_PCIE_PROTO_BAR_64)) {
                 attr |= PCI_BASE_ADDRESS_MEM_TYPE_64;
@@ -634,6 +635,8 @@ static void pci_cosim_realize(PCIDevice *pdev, Error **errp)
             label = "cosim-bar-mmio";
         } else {
             /* I/O port bar */
+            cosim->bar_info[i].is_io = true;
+
             label = "cosim-bar-ioport";
             attr = PCI_BASE_ADDRESS_SPACE_IO;
         }
