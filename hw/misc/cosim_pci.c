@@ -206,7 +206,18 @@ static void cosim_comm_d2h_dma_write(CosimPciState *cosim,
 static void cosim_comm_d2h_interrupt(CosimPciState *cosim,
         volatile struct cosim_pcie_proto_d2h_interrupt *interrupt)
 {
-    warn_report("cosim_comm_d2h_interrupt: TODO");
+    if (interrupt->inttype == COSIM_PCIE_PROTO_INT_MSI) {
+        if (interrupt->vector >= 32) {
+            warn_report("cosim_comm_d2h_interrupt: invalid MSI vector (%u)",
+                    interrupt->vector);
+            return;
+        }
+
+        msi_notify(&cosim->pdev, interrupt->vector);
+    } else {
+        warn_report("cosim_comm_d2h_interrupt: not yet implented int type (%u)"
+                " TODO", interrupt->inttype);
+    }
 }
 
 static void cosim_comm_d2h_rwcomp(CosimPciState *cosim, uint64_t req_id,
