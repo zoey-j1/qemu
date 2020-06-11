@@ -53,6 +53,7 @@ typedef struct CosimPciBarInfo {
 typedef struct CosimPciState {
     PCIDevice pdev;
 
+    EventNotifier notifier;
     QemuThread thread;
     QemuMutex thr_mutex;
     QemuCond thr_cond;
@@ -92,6 +93,7 @@ typedef struct CosimPciState {
         bool processing;        /* request is being processed by device */
         volatile bool requested;/* request waiting to be started */
     } req;
+    uint32_t msi_pending;
 } CosimPciState;
 
 static void panic(const char *msg, ...) __attribute__((noreturn));
@@ -213,7 +215,8 @@ static void cosim_comm_d2h_interrupt(CosimPciState *cosim,
             return;
         }
 
-        msi_notify(&cosim->pdev, interrupt->vector);
+        cosim->msi_pending |= 1 << interrupt->vector;
+        event_notifier_set(&cosim->notifier);
     } else {
         warn_report("cosim_comm_d2h_interrupt: not yet implented int type (%u)"
                 " TODO", interrupt->inttype);
@@ -585,6 +588,7 @@ static int cosim_connect(CosimPciState *cosim, Error **errp)
 
     cosim->req.processing = false;
     cosim->req.requested = false;
+    cosim->msi_pending = 0;
 
     /* set vendor, device, revision, and class id */
     pci_config_set_vendor_id(pci_conf, d_i->pci_vendor_id);
@@ -594,6 +598,24 @@ static int cosim_connect(CosimPciState *cosim, Error **errp)
             ((uint16_t) d_i->pci_class << 8) | d_i->pci_subclass);
 
     return 1;
+}
+
+static void cosim_event_notify(EventNotifier *notifier)
+{
+    CosimPciState *cosim = container_of(notifier, CosimPciState, notifier);
+    uint32_t i, bit;
+
+    event_notifier_test_and_clear(&cosim->notifier);
+    qemu_mutex_lock(&cosim->thr_mutex);
+    for (i = 0; i < 32 && cosim->msi_pending != 0; i++) {
+        bit = 1 << i;
+        if ((cosim->msi_pending & bit) == 0)
+            continue;
+        cosim->msi_pending &= ~bit;
+
+        msi_notify(&cosim->pdev, i);
+    }
+    qemu_mutex_unlock(&cosim->thr_mutex);
 }
 
 static void pci_cosim_realize(PCIDevice *pdev, Error **errp)
@@ -659,6 +681,10 @@ static void pci_cosim_realize(PCIDevice *pdev, Error **errp)
 
     //timer_init_ms(&cosim->dma_timer, QEMU_CLOCK_VIRTUAL, edu_dma_timer, cosim);
 
+    if (event_notifier_init(&cosim->notifier, 0))
+        panic("creatting notifier failed");
+    event_notifier_set_handler(&cosim->notifier, cosim_event_notify);
+
     qemu_mutex_init(&cosim->thr_mutex);
     qemu_cond_init(&cosim->thr_cond);
     qemu_thread_create(&cosim->thread, "cosim", cosim_comm_thread,
@@ -676,6 +702,7 @@ static void pci_cosim_uninit(PCIDevice *pdev)
 
     qemu_cond_destroy(&cosim->thr_cond);
     qemu_mutex_destroy(&cosim->thr_mutex);
+    event_notifier_cleanup(&cosim->notifier);
 
     if (cosim->dev_intro.pci_msi_nvecs > 0)
         msi_uninit(pdev);
