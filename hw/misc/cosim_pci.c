@@ -236,7 +236,7 @@ static void cosim_comm_d2h_rwcomp(CosimPciState *cosim, uint64_t req_id,
                 "(exp=%lu, got=%lu)\n", cosim->h2d_nextid, req_id);
     }
 
-    if ((data == NULL) != cosim->req.write) {
+    if (cosim->req.write) {
         panic("cosim_comm_d2h_rwcomp: completion type does not match request "
                 "type");
     }
@@ -298,7 +298,7 @@ static void cosim_comm_poll_d2h(CosimPciState *cosim)
                 break;
 
             case COSIM_PCIE_PROTO_D2H_MSG_WRITECOMP:
-                cosim_comm_d2h_rwcomp(cosim, msg->writecomp.req_id, NULL);
+                /* we treat writes as posted, so nothing we need to do here */
                 break;
 
             default:
@@ -360,6 +360,14 @@ static void cosim_comm_request(CosimPciState *cosim)
                       handing over ownership */
 
         write->own_type = COSIM_PCIE_PROTO_H2D_MSG_WRITE | COSIM_PCIE_PROTO_H2D_OWN_DEV;
+
+        /* we treat writes as posted, so this will complete immediately without
+         * waiting for a response. */
+        cosim->req.processing = false;
+        cosim->req.requested = false;
+
+        /* signal waiting main thread */
+        qemu_cond_signal(&cosim->thr_cond);
     } else {
         read = &msg->read;
 
@@ -372,11 +380,12 @@ static void cosim_comm_request(CosimPciState *cosim)
                       handing over ownership */
 
         read->own_type = COSIM_PCIE_PROTO_H2D_MSG_READ | COSIM_PCIE_PROTO_H2D_OWN_DEV;
+
+        /* start processing request */
+        cosim->req.processing = true;
+        cosim->req.requested = false;
     }
 
-    /* start processing request */
-    cosim->req.processing = true;
-    cosim->req.requested = false;
 
 out:
     qemu_mutex_unlock(&cosim->thr_mutex);
