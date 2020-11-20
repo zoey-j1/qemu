@@ -36,8 +36,12 @@
 #include "chardev/char-fe.h"
 #include "qapi/error.h"
 #include "qapi/visitor.h"
+#include "sysemu/cpus.h"
+#include "hw/core/cpu.h"
 
 #include <cosim_pcie_proto.h>
+
+#define COSIM_CLOCK QEMU_CLOCK_VIRTUAL
 
 #define TYPE_PCI_COSIM_DEVICE "cosim-pci"
 #define COSIM_PCI(obj)        OBJECT_CHECK(CosimPciState, obj, TYPE_PCI_COSIM_DEVICE)
@@ -48,15 +52,20 @@ typedef struct CosimPciBarInfo {
     bool is_io;
 } CosimPciBarInfo;
 
-
+typedef struct CosimPciRequest {
+    CPUState *cpu;          /* CPU associated with this request */
+    uint64_t addr;
+    uint8_t bar;
+    uint64_t value;         /* value read/to be written */
+    unsigned size;
+    bool processing;
+    bool requested;
+} CosimPciRequest;
 
 typedef struct CosimPciState {
     PCIDevice pdev;
 
-    EventNotifier notifier;
     QemuThread thread;
-    QemuMutex thr_mutex;
-    QemuCond thr_cond;
     bool stopping;
 
     CharBackend sim_chr;
@@ -80,21 +89,21 @@ typedef struct CosimPciState {
     size_t h2d_nentries;
     size_t h2d_elen;
     size_t h2d_pos;
-    uint64_t h2d_nextid;
 
     /* communication bewteen main io thread and worker thread
      * (protected by thr_mutex). */
-    struct CosimPciRequest {
-        uint64_t addr;          /* address for request */
-        uint64_t value;         /* value read/to be written */
-        unsigned size;          /* size for request */
-        uint8_t bar;            /* bar index */
-        bool write;             /* write if true, read otherwise */
-        bool processing;        /* request is being processed by device */
-        volatile bool requested;/* request waiting to be started */
-    } req;
-    uint32_t msi_pending;
+    size_t reqs_len;
+    CosimPciRequest *reqs;
+
+    /* timers for synchronization etc. */
+    uint64_t pci_latency;
+    uint64_t sync_period;
+    int64_t ts_base;
+    QEMUTimer *timer_sync;
+    QEMUTimer *timer_poll;
 } CosimPciState;
+
+void QEMU_NORETURN cpu_loop_exit(CPUState *cpu);
 
 static void panic(const char *msg, ...) __attribute__((noreturn));
 
@@ -109,34 +118,21 @@ static void panic(const char *msg, ...)
     abort();
 }
 
-#if 0
-static void edu_raise_irq(CosimPciState *cosim, uint32_t val)
+static inline uint64_t ts_to_proto(CosimPciState *cosim, int64_t qemu_ts)
 {
-    cosim->irq_status |= val;
-    if (cosim->irq_status) {
-        if (edu_msi_enabled(cosim)) {
-            msi_notify(&cosim->pdev, 0);
-        } else {
-            pci_set_irq(&cosim->pdev, 1);
-        }
-    }
+    return (qemu_ts - cosim->ts_base) * 1000;
 }
 
-static void edu_lower_irq(CosimPciState *cosim, uint32_t val)
+static inline int64_t ts_from_proto(CosimPciState *cosim, uint64_t proto_ts)
 {
-    cosim->irq_status &= ~val;
-
-    if (!cosim->irq_status && !edu_msi_enabled(cosim)) {
-        pci_set_irq(&cosim->pdev, 0);
-    }
+    return (proto_ts / 1000) + cosim->ts_base;
 }
-#endif
 
 /******************************************************************************/
 /* Worker thread */
 
 static volatile union cosim_pcie_proto_h2d *cosim_comm_h2d_alloc(
-        CosimPciState *cosim)
+        CosimPciState *cosim, int64_t ts)
 {
     uint8_t *pos;
     volatile union cosim_pcie_proto_h2d *msg;
@@ -152,28 +148,37 @@ static volatile union cosim_pcie_proto_h2d *cosim_comm_h2d_alloc(
         panic("cosim_comm_h2d_alloc: ran into non-owned entry in h2d queue");
     }
 
+    /* tag message with timestamp */
+    msg->dummy.timestamp = ts_to_proto(cosim, ts + cosim->pci_latency);
+
+    /* re-arm sync timer */
+    timer_mod_ns(cosim->timer_sync, ts + cosim->sync_period);
+
+#ifdef DEBUG_PRINTS
+    warn_report("cosim_comm_h2d_alloc: ts=%lu msg_ts=%lu", ts,
+            msg->dummy.timestamp);
+#endif
+
     /* advance position to next entry */
     cosim->h2d_pos = (cosim->h2d_pos + 1) % cosim->h2d_nentries;
 
     return msg;
 }
 
-static void cosim_comm_d2h_dma_read(CosimPciState *cosim,
+static void cosim_comm_d2h_dma_read(CosimPciState *cosim, int64_t ts,
         volatile struct cosim_pcie_proto_d2h_read *read)
 {
     volatile union cosim_pcie_proto_h2d *h2d;
     volatile struct cosim_pcie_proto_h2d_readcomp *rc;
 
     /* allocate completion */
-    h2d = cosim_comm_h2d_alloc(cosim);
+    h2d = cosim_comm_h2d_alloc(cosim, ts);
     rc = &h2d->readcomp;
 
     assert(read->len <= cosim->h2d_elen - sizeof (*rc));
 
     /* perform dma read */
-    //qemu_mutex_lock_iothread();
     pci_dma_read(&cosim->pdev, read->offset, (void *) rc->data, read->len);
-    //qemu_mutex_unlock_iothread();
 
     /* return completion */
     rc->req_id = read->req_id;
@@ -182,21 +187,19 @@ static void cosim_comm_d2h_dma_read(CosimPciState *cosim,
         COSIM_PCIE_PROTO_H2D_OWN_DEV;
 }
 
-static void cosim_comm_d2h_dma_write(CosimPciState *cosim,
+static void cosim_comm_d2h_dma_write(CosimPciState *cosim, int64_t ts,
         volatile struct cosim_pcie_proto_d2h_write *write)
 {
     volatile union cosim_pcie_proto_h2d *h2d;
     volatile struct cosim_pcie_proto_h2d_writecomp *wc;
 
     /* allocate completion */
-    h2d = cosim_comm_h2d_alloc(cosim);
+    h2d = cosim_comm_h2d_alloc(cosim, ts);
     wc = &h2d->writecomp;
 
     /* perform dma write */
-    //qemu_mutex_lock_iothread();
     pci_dma_write(&cosim->pdev, write->offset, (void *) write->data,
             write->len);
-    //qemu_mutex_unlock_iothread();
 
     /* return completion */
     wc->req_id = write->req_id;
@@ -214,128 +217,146 @@ static void cosim_comm_d2h_interrupt(CosimPciState *cosim,
                     interrupt->vector);
             return;
         }
-
-        cosim->msi_pending |= 1 << interrupt->vector;
-        event_notifier_set(&cosim->notifier);
+        msi_notify(&cosim->pdev, interrupt->vector);
     } else {
         warn_report("cosim_comm_d2h_interrupt: not yet implented int type (%u)"
                 " TODO", interrupt->inttype);
     }
 }
 
-static void cosim_comm_d2h_rwcomp(CosimPciState *cosim, uint64_t req_id,
-        const void *data)
+static void cosim_comm_d2h_rcomp(CosimPciState *cosim, uint64_t cur_ts,
+        uint64_t msg_ts, uint64_t req_id, const void *data)
 {
-    qemu_mutex_lock(&cosim->thr_mutex);
-    if (!cosim->req.processing) {
-        panic("cosim_comm_d2h_rwcomp: no request currently processing");
-    }
+    CosimPciRequest *req = cosim->reqs + req_id;
+    CPUState *cpu;
 
-    if (cosim->h2d_nextid != req_id) {
-        panic("cosim_comm_d2h_rwcomp: unexpected request completion "
-                "(exp=%lu, got=%lu)\n", cosim->h2d_nextid, req_id);
-    }
+    assert(req_id <= cosim->reqs_len);
 
-    if (cosim->req.write) {
-        panic("cosim_comm_d2h_rwcomp: completion type does not match request "
-                "type");
+    if (!req->processing) {
+        panic("cosim_comm_d2h_rcomp: no request currently processing");
     }
 
     /* copy read value from message */
-    if (data) {
-        cosim->req.value = 0;
-        memcpy(&cosim->req.value, data, cosim->req.size);
-    }
+    req->value = 0;
+    memcpy(&req->value, data, req->size);
 
-    cosim->req.processing = false;
+    req->processing = false;
 
-    /* signal waiting main thread */
-    qemu_cond_signal(&cosim->thr_cond);
-    qemu_mutex_unlock(&cosim->thr_mutex);
+    cpu = req->cpu;
+
+#ifdef DEBUG_PRINTS
+    warn_report("cosim_comm_d2h_rcomp: kicking cpu %lu ts=%lu msg_ts=%lu",
+            req_id, cur_ts, msg_ts);
+#endif
+
+    cpu->stopped = 0;
+    qemu_cpu_kick(cpu);
 }
 
 /* poll device-to-host queue */
-static void cosim_comm_poll_d2h(CosimPciState *cosim)
+static int cosim_comm_poll_d2h(CosimPciState *cosim, int64_t ts,
+        int64_t *next_ts)
 {
     uint8_t *pos;
     uint8_t type;
+    int64_t msg_ts;
     volatile union cosim_pcie_proto_d2h *msg;
 
-    while (1) {
-        pos = cosim->d2h_base + (cosim->d2h_elen * cosim->d2h_pos);
-        msg = (volatile union cosim_pcie_proto_d2h *) pos;
+    pos = cosim->d2h_base + (cosim->d2h_elen * cosim->d2h_pos);
+    msg = (volatile union cosim_pcie_proto_d2h *) pos;
 
-        /* check if this message is ready for us */
-        if ((msg->dummy.own_type & COSIM_PCIE_PROTO_D2H_OWN_MASK) !=
-            COSIM_PCIE_PROTO_D2H_OWN_HOST)
-        {
-            break;
-        }
-
-        smp_rmb();
-
-        type = msg->dummy.own_type & COSIM_PCIE_PROTO_D2H_MSG_MASK;
-        switch (type) {
-            case COSIM_PCIE_PROTO_D2H_MSG_SYNC:
-                /* nop */
-                break;
-
-            case COSIM_PCIE_PROTO_D2H_MSG_READ:
-                cosim_comm_d2h_dma_read(cosim, &msg->read);
-                break;
-
-            case COSIM_PCIE_PROTO_D2H_MSG_WRITE:
-                cosim_comm_d2h_dma_write(cosim, &msg->write);
-                break;
-
-            case COSIM_PCIE_PROTO_D2H_MSG_INTERRUPT:
-                cosim_comm_d2h_interrupt(cosim, &msg->interrupt);
-                break;
-
-            case COSIM_PCIE_PROTO_D2H_MSG_READCOMP:
-                cosim_comm_d2h_rwcomp(cosim, msg->readcomp.req_id,
-                        (void *) msg->readcomp.data);
-                break;
-
-            case COSIM_PCIE_PROTO_D2H_MSG_WRITECOMP:
-                /* we treat writes as posted, so nothing we need to do here */
-                break;
-
-            default:
-                panic("cosim_comm_poll_d2h: unhandled type");
-        }
-
-        smp_wmb();
-
-        /* mark message as done */
-        msg->dummy.own_type = (msg->dummy.own_type & COSIM_PCIE_PROTO_D2H_MSG_MASK) |
-            COSIM_PCIE_PROTO_D2H_OWN_DEV;
-
-        /* advance position to next entry */
-        cosim->d2h_pos = (cosim->d2h_pos + 1) % cosim->d2h_nentries;
+    /* check if this message is ready for us */
+    if ((msg->dummy.own_type & COSIM_PCIE_PROTO_D2H_OWN_MASK) !=
+        COSIM_PCIE_PROTO_D2H_OWN_HOST)
+    {
+        return -1;
     }
+
+    smp_rmb();
+    type = msg->dummy.own_type & COSIM_PCIE_PROTO_D2H_MSG_MASK;
+
+#ifdef DEBUG_PRINTS
+    warn_report("cosim_comm_poll_d2h: msg_ts=%ld ts=%ld t=%u", msg->dummy.timestamp, ts, type);
+#endif
+
+    msg_ts = ts_from_proto(cosim, msg->dummy.timestamp);
+    *next_ts = msg_ts;
+    if (msg_ts > ts) {
+        /* still in the future */
+        return 1;
+    }
+
+    switch (type) {
+        case COSIM_PCIE_PROTO_D2H_MSG_SYNC:
+            /* nop */
+            break;
+
+        case COSIM_PCIE_PROTO_D2H_MSG_READ:
+            cosim_comm_d2h_dma_read(cosim, ts, &msg->read);
+            break;
+
+        case COSIM_PCIE_PROTO_D2H_MSG_WRITE:
+            cosim_comm_d2h_dma_write(cosim, ts, &msg->write);
+            break;
+
+        case COSIM_PCIE_PROTO_D2H_MSG_INTERRUPT:
+            cosim_comm_d2h_interrupt(cosim, &msg->interrupt);
+            break;
+
+        case COSIM_PCIE_PROTO_D2H_MSG_READCOMP:
+            cosim_comm_d2h_rcomp(cosim, ts, msg_ts, msg->readcomp.req_id,
+                    (void *) msg->readcomp.data);
+            break;
+
+        case COSIM_PCIE_PROTO_D2H_MSG_WRITECOMP:
+            /* we treat writes as posted, so nothing we need to do here */
+            break;
+
+        default:
+            panic("cosim_comm_poll_d2h: unhandled type");
+    }
+
+    smp_wmb();
+
+    /* mark message as done */
+    msg->dummy.own_type = (msg->dummy.own_type & COSIM_PCIE_PROTO_D2H_MSG_MASK) |
+        COSIM_PCIE_PROTO_D2H_OWN_DEV;
+
+    /* advance position to next entry */
+    cosim->d2h_pos = (cosim->d2h_pos + 1) % cosim->d2h_nentries;
+
+    return 0;
 }
 
+#if 0
 /* handle requests from main thread and submit to host-to-device queue */
 static void cosim_comm_request(CosimPciState *cosim)
 {
     volatile union cosim_pcie_proto_h2d *msg;
     volatile struct cosim_pcie_proto_h2d_read *read;
     volatile struct cosim_pcie_proto_h2d_write *write;
+    CosimPciRequest *req;
+    CPUState *cpu = NULL;
 
     /* nothing new */
-    if (!cosim->req.requested) {
+    if (cosim->ready_first == NULL) {
         return;
     }
 
     qemu_mutex_lock(&cosim->thr_mutex);
-    if (!cosim->req.requested) {
+    req = cosim->ready_first;
+
+    if (req == NULL) {
         warn_report("cosim_comm_request: saw requested flag, but gone after "
                 "lock, this is probably a bug");
         goto out;
     }
 
-    if (cosim->req.processing) {
+    cosim->ready_first = req->next;
+    if (cosim->ready_first == NULL)
+        cosim->ready_last = NULL;
+
+    if (req->processing) {
         /* this should never happen as we synchronously submit requests. */
         panic("cosim_comm_request: received request while processing another");
     }
@@ -344,17 +365,17 @@ static void cosim_comm_request(CosimPciState *cosim)
     msg = cosim_comm_h2d_alloc(cosim);
 
     /* prepare operation */
-    if (cosim->req.write) {
+    if (req->write) {
         write = &msg->write;
 
-        write->req_id = ++cosim->h2d_nextid;
-        write->offset = cosim->req.addr;
-        write->len = cosim->req.size;
-        write->bar = cosim->req.bar;
+        write->req_id = req - cosim->reqs;
+        write->offset = req->addr;
+        write->len = req->size;
+        write->bar = req->bar;
 
-        assert(cosim->req.size <= cosim->h2d_elen - sizeof (*write));
+        assert(req->size <= cosim->h2d_elen - sizeof (*write));
         /* FIXME: this probably only works for LE */
-        memcpy((void *) write->data, &cosim->req.value, cosim->req.size);
+        memcpy((void *) write->data, &req->value, req->size);
 
         smp_wmb(); /* barrier to make sure earlier fields are written before
                       handing over ownership */
@@ -363,18 +384,18 @@ static void cosim_comm_request(CosimPciState *cosim)
 
         /* we treat writes as posted, so this will complete immediately without
          * waiting for a response. */
-        cosim->req.processing = false;
-        cosim->req.requested = false;
+        req->processing = false;
+        req->requested = false;
 
         /* signal waiting main thread */
-        qemu_cond_signal(&cosim->thr_cond);
+        cpu = req->cpu;
     } else {
         read = &msg->read;
 
-        read->req_id = ++cosim->h2d_nextid;
-        read->offset = cosim->req.addr;
-        read->len = cosim->req.size;
-        read->bar = cosim->req.bar;
+        read->req_id = req - cosim->reqs;
+        read->offset = req->addr;
+        read->len = req->size;
+        read->bar = req->bar;
 
         smp_wmb(); /* barrier to make sure earlier fields are written before
                       handing over ownership */
@@ -382,13 +403,20 @@ static void cosim_comm_request(CosimPciState *cosim)
         read->own_type = COSIM_PCIE_PROTO_H2D_MSG_READ | COSIM_PCIE_PROTO_H2D_OWN_DEV;
 
         /* start processing request */
-        cosim->req.processing = true;
-        cosim->req.requested = false;
+        req->processing = true;
+        req->requested = false;
     }
-
 
 out:
     qemu_mutex_unlock(&cosim->thr_mutex);
+
+    if (cpu != NULL) {
+        qemu_mutex_lock_iothread();
+        //warn_report("cosim_comm_d2h_rcomp: kicking cpu");
+        cpu->stopped = 0;
+        qemu_cpu_kick(cpu);
+        qemu_mutex_unlock_iothread();
+    }
 }
 
 static void *cosim_comm_thread(void *opaque)
@@ -439,6 +467,63 @@ static void *cosim_comm_thread(void *opaque)
 
     return NULL;
 }
+#endif
+
+static void cosim_trigger_sync(CosimPciState *cosim, int64_t cur_ts)
+{
+    volatile union cosim_pcie_proto_h2d *msg;
+    volatile struct cosim_pcie_proto_h2d_sync *sy;
+
+    msg = cosim_comm_h2d_alloc(cosim, cur_ts);
+    sy = &msg->sync;
+
+    smp_wmb(); /* barrier to make sure earlier fields are written before
+                  handing over ownership */
+
+    sy->own_type = COSIM_PCIE_PROTO_H2D_MSG_SYNC | COSIM_PCIE_PROTO_H2D_OWN_DEV;
+
+    /* cosim_comm_h2d_alloc has already re-scheduled the timer */
+}
+
+static void cosim_timer_poll(void *data)
+{
+    CosimPciState *cosim = data;
+    int64_t cur_ts, next_ts;
+
+    cur_ts = qemu_clock_get_ns(COSIM_CLOCK);
+
+    if (timer_expired(cosim->timer_sync, cur_ts)) {
+        //warn_report("cosim_timer_poll: triggering sync: ts=%ld sync_ts=%ld", cur_ts, timer_expire_time_ns(cosim->timer_sync));
+        cosim_trigger_sync(cosim, cur_ts);
+        //warn_report("cosim_timer_poll: triggered sync: ts=%ld sync_ts=%ld", cur_ts, timer_expire_time_ns(cosim->timer_sync));
+    }
+
+#ifdef DEBUG_PRINTS
+    warn_report("cosim_timer_poll: ts=%ld sync_ts=%ld", cur_ts, timer_expire_time_ns(cosim->timer_sync), timer_pending(cosim->timer_sync), timer_expired(cosim->timer_sync, cur_ts));
+#endif
+
+    /* poll until a message for a future timestamp is found */
+    while (cosim_comm_poll_d2h(cosim, cur_ts, &next_ts) <= 0);
+
+    timer_mod_anticipate_ns(cosim->timer_poll, next_ts);
+#ifdef DEBUG_PRINTS
+    warn_report("cosim_timer_poll: done");
+#endif
+}
+
+static void cosim_timer_sync(void *data)
+{
+    CosimPciState *cosim = data;
+    int64_t cur_ts;
+
+    cur_ts = qemu_clock_get_ns(COSIM_CLOCK);
+
+#ifdef DEBUG_PRINTS
+    warn_report("cosim_timer_sync: ts=%ld", cur_ts);
+#endif
+
+    cosim_trigger_sync(cosim, cur_ts);
+}
 
 /******************************************************************************/
 /* MMIO interface */
@@ -446,33 +531,129 @@ static void *cosim_comm_thread(void *opaque)
 /* submit a bar read or write to the worker thread and wait for it to
  * complete */
 static void cosim_mmio_rw(CosimPciState *cosim, uint8_t bar, hwaddr addr,
-        unsigned size, uint64_t *val, bool write)
+        unsigned size, uint64_t *val, bool is_write)
 {
-    qemu_mutex_lock(&cosim->thr_mutex);
+    CPUState *cpu = current_cpu;
+    CosimPciRequest *req;
+    volatile union cosim_pcie_proto_h2d *msg;
+    volatile struct cosim_pcie_proto_h2d_read *read;
+    volatile struct cosim_pcie_proto_h2d_write *write;
+    int64_t cur_ts;
 
-    /* we only ever submit one at a time, so there should not be any ongoing
-     * requests */
-    assert(!cosim->req.requested && !cosim->req.processing);
+    assert(cosim->reqs_len > cpu->cpu_index);
+    req = cosim->reqs + cpu->cpu_index;
+    assert(req->cpu == cpu);
 
-    cosim->req.addr = addr;
-    cosim->req.size = size;
-    cosim->req.bar = bar;
-    cosim->req.write = write;
+    cur_ts = qemu_clock_get_ns(COSIM_CLOCK);
 
-    if (write) {
-        cosim->req.value = *val;
+    if (req->requested) {
+        /* a request from this CPU has been started */
+        /* note that address might not match if an interrupt occurs, which in
+         * turn triggers another read. */
+
+        if (req->processing) {
+            /* request in progress, we have to wait */
+            //warn_report("cosim_mmio_rw: still processing (%lu) %d", cur_ts, cpu->stopped);
+            cpu->stopped = 1;
+            //cpu->exception_index = EXCP_stopped;
+            cpu_loop_exit(cpu);
+        } else if (req->addr == addr && req->bar == bar && req->size == size) {
+            /* request finished */
+#ifdef DEBUG_PRINTS
+            warn_report("cosim_mmio_rw: done (%lu) a=%lx s=%x val=%lx", cur_ts, addr, size, req->value);
+#endif
+            *val = req->value;
+            req->requested = false;
+            return;
+        } else {
+            /* request is done processing, but for a different address */
+            req->requested = false;
+        }
     }
-    cosim->req.requested = true;
 
-    /* wait for operation to finish */
-    while (cosim->req.requested || cosim->req.processing) {
-        qemu_cond_wait(&cosim->thr_cond, &cosim->thr_mutex);
+    assert(!req->processing);
+
+
+    /* allocate host-to-device queue entry */
+    msg = cosim_comm_h2d_alloc(cosim, cur_ts);
+
+    /* prepare operation */
+    if (is_write) {
+        write = &msg->write;
+
+        write->req_id = cpu->cpu_index;
+        write->offset = addr;
+        write->len = size;
+        write->bar = bar;
+
+        assert(size <= cosim->h2d_elen - sizeof (*write));
+        /* FIXME: this probably only works for LE */
+        memcpy((void *) write->data, val, size);
+
+        smp_wmb(); /* barrier to make sure earlier fields are written before
+                      handing over ownership */
+
+        write->own_type = COSIM_PCIE_PROTO_H2D_MSG_WRITE |
+            COSIM_PCIE_PROTO_H2D_OWN_DEV;
+
+#ifdef DEBUG_PRINTS
+        warn_report("cosim_mmio_rw: finished write (%lu) addr=%lx size=%x val=%lx",
+                cur_ts, addr, size, *val);
+#endif
+
+        /* we treat writes as posted and don't wait for completion */
+        return;
+    } else {
+        read = &msg->read;
+
+        read->req_id = req - cosim->reqs;
+        read->offset = addr;
+        read->len = size;
+        read->bar = bar;
+
+        smp_wmb(); /* barrier to make sure earlier fields are written before
+                      handing over ownership */
+
+        read->own_type = COSIM_PCIE_PROTO_H2D_MSG_READ |
+            COSIM_PCIE_PROTO_H2D_OWN_DEV;
+
+        /* start processing request */
+        req->processing = true;
+        req->requested = true;
+        req->size = size;
+
+        req->addr = addr;
+        req->bar = bar;
+        req->size = size;
+
+        cpu->stopped = 1;
+        //cpu->exception_index = EXCP_stopped;
+
+#ifdef DEBUG_PRINTS
+        warn_report("cosim_mmio_rw: starting wait for read (%lu) addr=%lx size=%x", cur_ts, addr, size);
+#endif
+
+        cpu_loop_exit(cpu);
     }
 
-    if (!write) {
-        *val = cosim->req.value;
+#if 0
+
+    while (req->processing) {
+        //qemu_wait_io_event(cpu);
+        cpu_loop_exit(cpu);
+
+        /* in case an interrupt set this one again */
+        cpu->stopped = 1;
+
+        warn_report("cosim_mmio_rw: re-trying");
     }
-    qemu_mutex_unlock(&cosim->thr_mutex);
+
+    /*if (!write)*/
+    warn_report("cosim_mmio_rw: done (%lu)", qemu_clock_get_ns(COSIM_CLOCK));
+    //warn_report("cosim_mmio_rw: done");
+
+    *val = req->value;
+#endif
 }
 
 static uint64_t cosim_mmio_read(void *opaque, hwaddr addr, unsigned size)
@@ -499,6 +680,10 @@ static const MemoryRegionOps cosim_mmio_ops = {
     .read = cosim_mmio_read,
     .write = cosim_mmio_write,
     .endianness = DEVICE_NATIVE_ENDIAN,
+    .valid.max_access_size = 64,
+    .impl.max_access_size = 64,
+    .valid.unaligned = true,
+    .impl.unaligned = true,
 };
 
 
@@ -512,6 +697,7 @@ static int cosim_connect(CosimPciState *cosim, Error **errp)
     struct cosim_pcie_proto_host_intro host_intro;
     struct stat statbuf;
     int ret, off, len;
+    CPUState *cpu;
     void *p;
     uint8_t *pci_conf = cosim->pdev.config;
 
@@ -522,6 +708,7 @@ static int cosim_connect(CosimPciState *cosim, Error **errp)
 
     /* send host intro */
     memset(&host_intro, 0, sizeof(host_intro));
+    host_intro.flags = COSIM_PCIE_PROTO_FLAGS_HI_SYNC;
 
     len = sizeof(host_intro);
     off = 0;
@@ -555,6 +742,11 @@ static int cosim_connect(CosimPciState *cosim, Error **errp)
         }
         off += ret;
 
+    }
+
+    if (!(d_i->flags & COSIM_PCIE_PROTO_FLAGS_DI_SYNC)) {
+        error_setg(errp, "cosim_connect: sync not reciprocated");
+        return 0;
     }
 
     /* get shared memory fd */
@@ -593,11 +785,21 @@ static int cosim_connect(CosimPciState *cosim, Error **errp)
     cosim->h2d_elen = d_i->h2d_elen;
     cosim->h2d_nentries = d_i->h2d_nentries;
     cosim->h2d_pos = 0;
-    cosim->h2d_nextid = 0;
 
-    cosim->req.processing = false;
-    cosim->req.requested = false;
-    cosim->msi_pending = 0;
+    cosim->reqs_len = 0;
+    CPU_FOREACH(cpu) {
+        cosim->reqs_len++;
+    }
+    cosim->reqs = calloc(cosim->reqs_len, sizeof(*cosim->reqs));
+    CPU_FOREACH(cpu) {
+        cosim->reqs[cpu->cpu_index].cpu = cpu;
+    }
+
+    cosim->ts_base = qemu_clock_get_ns(COSIM_CLOCK);
+    cosim->timer_sync = timer_new_ns(COSIM_CLOCK, cosim_timer_sync, cosim);
+    timer_mod_ns(cosim->timer_sync, cosim->ts_base);
+    cosim->timer_poll = timer_new_ns(COSIM_CLOCK, cosim_timer_poll, cosim);
+    timer_mod_ns(cosim->timer_poll, cosim->ts_base + 1);
 
     /* set vendor, device, revision, and class id */
     pci_config_set_vendor_id(pci_conf, d_i->pci_vendor_id);
@@ -607,24 +809,6 @@ static int cosim_connect(CosimPciState *cosim, Error **errp)
             ((uint16_t) d_i->pci_class << 8) | d_i->pci_subclass);
 
     return 1;
-}
-
-static void cosim_event_notify(EventNotifier *notifier)
-{
-    CosimPciState *cosim = container_of(notifier, CosimPciState, notifier);
-    uint32_t i, bit;
-
-    event_notifier_test_and_clear(&cosim->notifier);
-    qemu_mutex_lock(&cosim->thr_mutex);
-    for (i = 0; i < 32 && cosim->msi_pending != 0; i++) {
-        bit = 1 << i;
-        if ((cosim->msi_pending & bit) == 0)
-            continue;
-        cosim->msi_pending &= ~bit;
-
-        msi_notify(&cosim->pdev, i);
-    }
-    qemu_mutex_unlock(&cosim->thr_mutex);
 }
 
 static void pci_cosim_realize(PCIDevice *pdev, Error **errp)
@@ -688,30 +872,23 @@ static void pci_cosim_realize(PCIDevice *pdev, Error **errp)
         pci_register_bar(pdev, i, attr, &cosim->mmio_bars[i]);
     }
 
-    //timer_init_ms(&cosim->dma_timer, QEMU_CLOCK_VIRTUAL, edu_dma_timer, cosim);
-
-    if (event_notifier_init(&cosim->notifier, 0))
-        panic("creatting notifier failed");
-    event_notifier_set_handler(&cosim->notifier, cosim_event_notify);
-
-    qemu_mutex_init(&cosim->thr_mutex);
-    qemu_cond_init(&cosim->thr_cond);
-    qemu_thread_create(&cosim->thread, "cosim", cosim_comm_thread,
-                       cosim, QEMU_THREAD_JOINABLE);
+    /*qemu_thread_create(&cosim->thread, "cosim", cosim_comm_thread,
+                       cosim, QEMU_THREAD_JOINABLE);*/
 }
 
 static void pci_cosim_uninit(PCIDevice *pdev)
 {
     CosimPciState *cosim = COSIM_PCI(pdev);
 
-    qemu_mutex_lock(&cosim->thr_mutex);
-    cosim->stopping = true;
-    qemu_mutex_unlock(&cosim->thr_mutex);
-    qemu_thread_join(&cosim->thread);
+    /*cosim->stopping = true;
+    qemu_thread_join(&cosim->thread);*/
 
-    qemu_cond_destroy(&cosim->thr_cond);
-    qemu_mutex_destroy(&cosim->thr_mutex);
-    event_notifier_cleanup(&cosim->notifier);
+    free(cosim->reqs);
+
+    timer_del(cosim->timer_sync);
+    timer_free(cosim->timer_sync);
+    timer_del(cosim->timer_poll);
+    timer_free(cosim->timer_poll);
 
     if (cosim->dev_intro.pci_msi_nvecs > 0)
         msi_uninit(pdev);
@@ -724,6 +901,8 @@ static void cosim_pci_instance_init(Object *obj)
 
 static Property cosim_pci_dev_properties[] = {
   DEFINE_PROP_CHR("chardev", CosimPciState, sim_chr),
+  DEFINE_PROP_UINT64("pci-latency", CosimPciState, pci_latency, 500),
+  DEFINE_PROP_UINT64("sync-period", CosimPciState, sync_period, 500),
   DEFINE_PROP_END_OF_LIST(),
 };
 
