@@ -41,6 +41,8 @@
 
 #include <cosim_pcie_proto.h>
 
+//#define DEBUG_PRINTS
+
 #define COSIM_CLOCK QEMU_CLOCK_VIRTUAL
 
 #define TYPE_PCI_COSIM_DEVICE "cosim-pci"
@@ -100,7 +102,10 @@ typedef struct CosimPciState {
     uint64_t sync_period;
     int64_t ts_base;
     QEMUTimer *timer_sync;
+    int64_t sync_ts;
+    bool sync_ts_bumped;
     QEMUTimer *timer_poll;
+    int64_t poll_ts;
 } CosimPciState;
 
 void QEMU_NORETURN cpu_loop_exit(CPUState *cpu);
@@ -152,11 +157,12 @@ static volatile union cosim_pcie_proto_h2d *cosim_comm_h2d_alloc(
     msg->dummy.timestamp = ts_to_proto(cosim, ts + cosim->pci_latency);
 
     /* re-arm sync timer */
-    timer_mod_ns(cosim->timer_sync, ts + cosim->sync_period);
+    cosim->sync_ts = ts + cosim->sync_period;
+    cosim->sync_ts_bumped = true;
 
 #ifdef DEBUG_PRINTS
-    warn_report("cosim_comm_h2d_alloc: ts=%lu msg_ts=%lu", ts,
-            msg->dummy.timestamp);
+    warn_report("cosim_comm_h2d_alloc: ts=%lu msg_ts=%lu next=%ld", ts,
+            msg->dummy.timestamp, ts + cosim->sync_period);
 #endif
 
     /* advance position to next entry */
@@ -250,7 +256,7 @@ static void cosim_comm_d2h_rcomp(CosimPciState *cosim, uint64_t cur_ts,
 #endif
 
     cpu->stopped = 0;
-    qemu_cpu_kick(cpu);
+    //qemu_cpu_kick(cpu);
 }
 
 /* poll device-to-host queue */
@@ -491,9 +497,11 @@ static void cosim_timer_poll(void *data)
     int64_t cur_ts, next_ts;
 
     cur_ts = qemu_clock_get_ns(COSIM_CLOCK);
+    if (cur_ts > cosim->poll_ts + 1 || cur_ts < cosim->poll_ts)
+        warn_report("cosim_timer_poll: expected_ts=%lu cur_ts=%lu", cosim->poll_ts, cur_ts);
 
-    if (timer_expired(cosim->timer_sync, cur_ts)) {
-        //warn_report("cosim_timer_poll: triggering sync: ts=%ld sync_ts=%ld", cur_ts, timer_expire_time_ns(cosim->timer_sync));
+    if (cur_ts > cosim->sync_ts + 1) {
+        warn_report("cosim_timer_poll: triggering sync: ts=%ld sync_ts=%ld", cur_ts, timer_expire_time_ns(cosim->timer_sync));
         cosim_trigger_sync(cosim, cur_ts);
         //warn_report("cosim_timer_poll: triggered sync: ts=%ld sync_ts=%ld", cur_ts, timer_expire_time_ns(cosim->timer_sync));
     }
@@ -505,9 +513,24 @@ static void cosim_timer_poll(void *data)
     /* poll until a message for a future timestamp is found */
     while (cosim_comm_poll_d2h(cosim, cur_ts, &next_ts) <= 0);
 
-    timer_mod_anticipate_ns(cosim->timer_poll, next_ts);
+    int64_t now_ts = qemu_clock_get_ns(COSIM_CLOCK);
+    if (cur_ts != now_ts)
+        warn_report("cosim_timer_poll: time advanced from %lu to %lu", cur_ts, now_ts);
+
+    /* make sure we set the lower timer first */
+    if (cosim->sync_ts_bumped &&  cosim->sync_ts < next_ts) {
+        timer_mod_ns(cosim->timer_sync, cosim->sync_ts);
+        cosim->sync_ts_bumped = false;
+    }
+    timer_mod_ns(cosim->timer_poll, next_ts);
+    cosim->poll_ts = next_ts;
+    if (cosim->sync_ts_bumped &&  cosim->sync_ts >= next_ts) {
+        timer_mod_ns(cosim->timer_sync, cosim->sync_ts);
+        cosim->sync_ts_bumped = false;
+    }
+
 #ifdef DEBUG_PRINTS
-    warn_report("cosim_timer_poll: done");
+    warn_report("cosim_timer_poll: done, next=%ld", next_ts);
 #endif
 }
 
@@ -518,11 +541,22 @@ static void cosim_timer_sync(void *data)
 
     cur_ts = qemu_clock_get_ns(COSIM_CLOCK);
 
+    if (cur_ts > cosim->sync_ts + 1)
+        warn_report("cosim_timer_sync: expected_ts=%lu cur_ts=%lu", cosim->sync_ts, cur_ts);
+
 #ifdef DEBUG_PRINTS
     warn_report("cosim_timer_sync: ts=%ld", cur_ts);
 #endif
 
     cosim_trigger_sync(cosim, cur_ts);
+
+    int64_t now_ts = qemu_clock_get_ns(COSIM_CLOCK);
+    if (cur_ts != now_ts)
+        warn_report("cosim_timer_poll: time advanced from %lu to %lu", cur_ts, now_ts);
+
+    assert(cosim->sync_ts_bumped);
+    timer_mod_ns(cosim->timer_sync, cosim->sync_ts);
+    cosim->sync_ts_bumped = false;
 }
 
 /******************************************************************************/
@@ -797,7 +831,9 @@ static int cosim_connect(CosimPciState *cosim, Error **errp)
 
     cosim->ts_base = qemu_clock_get_ns(COSIM_CLOCK);
     cosim->timer_sync = timer_new_ns(COSIM_CLOCK, cosim_timer_sync, cosim);
+    cosim->sync_ts = cosim->ts_base;
     timer_mod_ns(cosim->timer_sync, cosim->ts_base);
+    cosim->poll_ts = cosim->ts_base + 1;
     cosim->timer_poll = timer_new_ns(COSIM_CLOCK, cosim_timer_poll, cosim);
     timer_mod_ns(cosim->timer_poll, cosim->ts_base + 1);
 
