@@ -101,6 +101,7 @@ typedef struct CosimPciState {
     uint64_t pci_latency;
     uint64_t sync_period;
     int64_t ts_base;
+    QEMUTimer *timer_dummy;
     QEMUTimer *timer_sync;
     int64_t sync_ts;
     bool sync_ts_bumped;
@@ -231,7 +232,7 @@ static void cosim_comm_d2h_interrupt(CosimPciState *cosim,
 }
 
 static void cosim_comm_d2h_rcomp(CosimPciState *cosim, uint64_t cur_ts,
-        uint64_t msg_ts, uint64_t req_id, const void *data)
+        uint64_t req_id, const void *data)
 {
     CosimPciRequest *req = cosim->reqs + req_id;
     CPUState *cpu;
@@ -251,46 +252,21 @@ static void cosim_comm_d2h_rcomp(CosimPciState *cosim, uint64_t cur_ts,
     cpu = req->cpu;
 
 #ifdef DEBUG_PRINTS
-    warn_report("cosim_comm_d2h_rcomp: kicking cpu %lu ts=%lu msg_ts=%lu",
-            req_id, cur_ts, msg_ts);
+    warn_report("cosim_comm_d2h_rcomp: kicking cpu %lu ts=%lu",
+            req_id, cur_ts);
 #endif
 
     cpu->stopped = 0;
     //qemu_cpu_kick(cpu);
 }
 
-/* poll device-to-host queue */
-static int cosim_comm_poll_d2h(CosimPciState *cosim, int64_t ts,
-        int64_t *next_ts)
+/* process and complete message */
+static void cosim_comm_d2h_process(CosimPciState *cosim, int64_t ts,
+        volatile union cosim_pcie_proto_d2h *msg)
 {
-    uint8_t *pos;
     uint8_t type;
-    int64_t msg_ts;
-    volatile union cosim_pcie_proto_d2h *msg;
 
-    pos = cosim->d2h_base + (cosim->d2h_elen * cosim->d2h_pos);
-    msg = (volatile union cosim_pcie_proto_d2h *) pos;
-
-    /* check if this message is ready for us */
-    if ((msg->dummy.own_type & COSIM_PCIE_PROTO_D2H_OWN_MASK) !=
-        COSIM_PCIE_PROTO_D2H_OWN_HOST)
-    {
-        return -1;
-    }
-
-    smp_rmb();
     type = msg->dummy.own_type & COSIM_PCIE_PROTO_D2H_MSG_MASK;
-
-#ifdef DEBUG_PRINTS
-    warn_report("cosim_comm_poll_d2h: msg_ts=%ld ts=%ld t=%u", msg->dummy.timestamp, ts, type);
-#endif
-
-    msg_ts = ts_from_proto(cosim, msg->dummy.timestamp);
-    *next_ts = msg_ts;
-    if (msg_ts > ts) {
-        /* still in the future */
-        return 1;
-    }
 
     switch (type) {
         case COSIM_PCIE_PROTO_D2H_MSG_SYNC:
@@ -310,7 +286,7 @@ static int cosim_comm_poll_d2h(CosimPciState *cosim, int64_t ts,
             break;
 
         case COSIM_PCIE_PROTO_D2H_MSG_READCOMP:
-            cosim_comm_d2h_rcomp(cosim, ts, msg_ts, msg->readcomp.req_id,
+            cosim_comm_d2h_rcomp(cosim, ts, msg->readcomp.req_id,
                     (void *) msg->readcomp.data);
             break;
 
@@ -327,153 +303,47 @@ static int cosim_comm_poll_d2h(CosimPciState *cosim, int64_t ts,
     /* mark message as done */
     msg->dummy.own_type = (msg->dummy.own_type & COSIM_PCIE_PROTO_D2H_MSG_MASK) |
         COSIM_PCIE_PROTO_D2H_OWN_DEV;
+}
 
-    /* advance position to next entry */
-    cosim->d2h_pos = (cosim->d2h_pos + 1) % cosim->d2h_nentries;
+/* peek at head of d2h queue */
+static int cosim_comm_d2h_peek(CosimPciState *cosim, int64_t ts,
+        int64_t *next_ts, volatile union cosim_pcie_proto_d2h **pmsg)
+{
+    uint8_t *pos;
+    int64_t msg_ts;
+    volatile union cosim_pcie_proto_d2h *msg;
 
+    pos = cosim->d2h_base + (cosim->d2h_elen * cosim->d2h_pos);
+    msg = (volatile union cosim_pcie_proto_d2h *) pos;
+
+    /* check if this message is ready for us */
+    if ((msg->dummy.own_type & COSIM_PCIE_PROTO_D2H_OWN_MASK) !=
+        COSIM_PCIE_PROTO_D2H_OWN_HOST)
+    {
+        return -1;
+    }
+
+    smp_rmb();
+
+    msg_ts = ts_from_proto(cosim, msg->dummy.timestamp);
+
+    *pmsg = msg;
+    *next_ts = msg_ts;
+    if (msg_ts > ts) {
+        /* still in the future */
+        return 1;
+    }
+
+    *pmsg = msg;
     return 0;
 }
 
-#if 0
-/* handle requests from main thread and submit to host-to-device queue */
-static void cosim_comm_request(CosimPciState *cosim)
+/* move on to next d2h queue position */
+static void cosim_comm_d2h_next(CosimPciState *cosim)
 {
-    volatile union cosim_pcie_proto_h2d *msg;
-    volatile struct cosim_pcie_proto_h2d_read *read;
-    volatile struct cosim_pcie_proto_h2d_write *write;
-    CosimPciRequest *req;
-    CPUState *cpu = NULL;
-
-    /* nothing new */
-    if (cosim->ready_first == NULL) {
-        return;
-    }
-
-    qemu_mutex_lock(&cosim->thr_mutex);
-    req = cosim->ready_first;
-
-    if (req == NULL) {
-        warn_report("cosim_comm_request: saw requested flag, but gone after "
-                "lock, this is probably a bug");
-        goto out;
-    }
-
-    cosim->ready_first = req->next;
-    if (cosim->ready_first == NULL)
-        cosim->ready_last = NULL;
-
-    if (req->processing) {
-        /* this should never happen as we synchronously submit requests. */
-        panic("cosim_comm_request: received request while processing another");
-    }
-
-    /* allocate host-to-device queue entry */
-    msg = cosim_comm_h2d_alloc(cosim);
-
-    /* prepare operation */
-    if (req->write) {
-        write = &msg->write;
-
-        write->req_id = req - cosim->reqs;
-        write->offset = req->addr;
-        write->len = req->size;
-        write->bar = req->bar;
-
-        assert(req->size <= cosim->h2d_elen - sizeof (*write));
-        /* FIXME: this probably only works for LE */
-        memcpy((void *) write->data, &req->value, req->size);
-
-        smp_wmb(); /* barrier to make sure earlier fields are written before
-                      handing over ownership */
-
-        write->own_type = COSIM_PCIE_PROTO_H2D_MSG_WRITE | COSIM_PCIE_PROTO_H2D_OWN_DEV;
-
-        /* we treat writes as posted, so this will complete immediately without
-         * waiting for a response. */
-        req->processing = false;
-        req->requested = false;
-
-        /* signal waiting main thread */
-        cpu = req->cpu;
-    } else {
-        read = &msg->read;
-
-        read->req_id = req - cosim->reqs;
-        read->offset = req->addr;
-        read->len = req->size;
-        read->bar = req->bar;
-
-        smp_wmb(); /* barrier to make sure earlier fields are written before
-                      handing over ownership */
-
-        read->own_type = COSIM_PCIE_PROTO_H2D_MSG_READ | COSIM_PCIE_PROTO_H2D_OWN_DEV;
-
-        /* start processing request */
-        req->processing = true;
-        req->requested = false;
-    }
-
-out:
-    qemu_mutex_unlock(&cosim->thr_mutex);
-
-    if (cpu != NULL) {
-        qemu_mutex_lock_iothread();
-        //warn_report("cosim_comm_d2h_rcomp: kicking cpu");
-        cpu->stopped = 0;
-        qemu_cpu_kick(cpu);
-        qemu_mutex_unlock_iothread();
-    }
+    /* advance position to next entry */
+    cosim->d2h_pos = (cosim->d2h_pos + 1) % cosim->d2h_nentries;
 }
-
-static void *cosim_comm_thread(void *opaque)
-{
-    CosimPciState *cosim = opaque;
-
-    while (!cosim->stopping) {
-        cosim_comm_poll_d2h(cosim);
-        cosim_comm_request(cosim);
-#if 0
-        uint32_t val, ret = 1;
-
-        qemu_mutex_lock(&cosim->thr_mutex);
-        while ((atomic_read(&cosim->status) & EDU_STATUS_COMPUTING) == 0 &&
-                        !cosim->stopping) {
-            qemu_cond_wait(&cosim->thr_cond, &cosim->thr_mutex);
-        }
-
-        if (cosim->stopping) {
-            qemu_mutex_unlock(&cosim->thr_mutex);
-            break;
-        }
-
-        val = cosim->fact;
-        qemu_mutex_unlock(&cosim->thr_mutex);
-
-        while (val > 0) {
-            ret *= val--;
-        }
-
-        /*
-         * We should sleep for a random period here, so that students are
-         * forced to check the status properly.
-         */
-
-        qemu_mutex_lock(&cosim->thr_mutex);
-        cosim->fact = ret;
-        qemu_mutex_unlock(&cosim->thr_mutex);
-        atomic_and(&cosim->status, ~EDU_STATUS_COMPUTING);
-
-        if (atomic_read(&cosim->status) & EDU_STATUS_IRQFACT) {
-            qemu_mutex_lock_iothread();
-            edu_raise_irq(cosim, FACT_IRQ);
-            qemu_mutex_unlock_iothread();
-        }
-#endif
-    }
-
-    return NULL;
-}
-#endif
 
 static void cosim_trigger_sync(CosimPciState *cosim, int64_t cur_ts)
 {
@@ -491,10 +361,17 @@ static void cosim_trigger_sync(CosimPciState *cosim, int64_t cur_ts)
     /* cosim_comm_h2d_alloc has already re-scheduled the timer */
 }
 
+static void cosim_timer_dummy(void *data)
+{
+}
+
 static void cosim_timer_poll(void *data)
 {
     CosimPciState *cosim = data;
+    volatile union cosim_pcie_proto_d2h *msg;
+    volatile union cosim_pcie_proto_d2h *next_msg;
     int64_t cur_ts, next_ts;
+    int ret;
 
     cur_ts = qemu_clock_get_ns(COSIM_CLOCK);
     if (cur_ts > cosim->poll_ts + 1 || cur_ts < cosim->poll_ts)
@@ -503,33 +380,49 @@ static void cosim_timer_poll(void *data)
     if (cur_ts > cosim->sync_ts + 1) {
         warn_report("cosim_timer_poll: triggering sync: ts=%ld sync_ts=%ld", cur_ts, timer_expire_time_ns(cosim->timer_sync));
         cosim_trigger_sync(cosim, cur_ts);
-        //warn_report("cosim_timer_poll: triggered sync: ts=%ld sync_ts=%ld", cur_ts, timer_expire_time_ns(cosim->timer_sync));
     }
 
 #ifdef DEBUG_PRINTS
     warn_report("cosim_timer_poll: ts=%ld sync_ts=%ld", cur_ts, timer_expire_time_ns(cosim->timer_sync), timer_pending(cosim->timer_sync), timer_expired(cosim->timer_sync, cur_ts));
 #endif
 
-    /* poll until a message for a future timestamp is found */
-    while (cosim_comm_poll_d2h(cosim, cur_ts, &next_ts) <= 0);
+    /* poll until we have a message */
+    do {
+        ret = cosim_comm_d2h_peek(cosim, cur_ts, &next_ts, &msg);
+    } while (ret < 0);
 
+    if (ret == 0) {
+        /* message is ready to be processed */
+        cosim_comm_d2h_next(cosim);
+
+        /* now poll until we have next message so we know the timestamp */
+        while (cosim_comm_d2h_peek(cosim, cur_ts, &next_ts, &next_msg) < 0);
+    } else {
+        next_msg = msg;
+    }
+
+    /* set timer for next message */
+    /* we need to do this before actually processing the message, in order to
+     * have a timer set to prevent the clock from running away from us. We set a
+     * dummy timer with the current ts to prevent the clock from jumping */
+    timer_mod_ns(cosim->timer_dummy, cur_ts);
+    timer_mod_ns(cosim->timer_poll, next_ts);
+    if (cosim->sync_ts_bumped) {
+        timer_mod_ns(cosim->timer_sync, cosim->sync_ts);
+        cosim->sync_ts_bumped = false;
+    }
+    cosim->poll_ts = next_ts;
+
+    /* run */
+    if (ret == 0) {
+        cosim_comm_d2h_process(cosim, cur_ts, msg);
+    }
+
+#ifdef DEBUG_PRINTS
     int64_t now_ts = qemu_clock_get_ns(COSIM_CLOCK);
     if (cur_ts != now_ts)
         warn_report("cosim_timer_poll: time advanced from %lu to %lu", cur_ts, now_ts);
 
-    /* make sure we set the lower timer first */
-    if (cosim->sync_ts_bumped &&  cosim->sync_ts < next_ts) {
-        timer_mod_ns(cosim->timer_sync, cosim->sync_ts);
-        cosim->sync_ts_bumped = false;
-    }
-    timer_mod_ns(cosim->timer_poll, next_ts);
-    cosim->poll_ts = next_ts;
-    if (cosim->sync_ts_bumped &&  cosim->sync_ts >= next_ts) {
-        timer_mod_ns(cosim->timer_sync, cosim->sync_ts);
-        cosim->sync_ts_bumped = false;
-    }
-
-#ifdef DEBUG_PRINTS
     warn_report("cosim_timer_poll: done, next=%ld", next_ts);
 #endif
 }
@@ -828,6 +721,8 @@ static int cosim_connect(CosimPciState *cosim, Error **errp)
     CPU_FOREACH(cpu) {
         cosim->reqs[cpu->cpu_index].cpu = cpu;
     }
+
+    cosim->timer_dummy = timer_new_ns(COSIM_CLOCK, cosim_timer_dummy, cosim);
 
     cosim->ts_base = qemu_clock_get_ns(COSIM_CLOCK);
     cosim->timer_sync = timer_new_ns(COSIM_CLOCK, cosim_timer_sync, cosim);
