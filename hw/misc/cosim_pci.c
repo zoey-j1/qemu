@@ -480,9 +480,7 @@ static void cosim_mmio_rw(CosimPciState *cosim, uint8_t bar, hwaddr addr,
 
         if (req->processing) {
             /* request in progress, we have to wait */
-            //warn_report("cosim_mmio_rw: still processing (%lu) %d", cur_ts, cpu->stopped);
             cpu->stopped = 1;
-            //cpu->exception_index = EXCP_stopped;
             cpu_loop_exit(cpu);
         } else if (req->addr == addr && req->bar == bar && req->size == size) {
             /* request finished */
@@ -554,7 +552,6 @@ static void cosim_mmio_rw(CosimPciState *cosim, uint8_t bar, hwaddr addr,
         req->size = size;
 
         cpu->stopped = 1;
-        //cpu->exception_index = EXCP_stopped;
 
 #ifdef DEBUG_PRINTS
         warn_report("cosim_mmio_rw: starting wait for read (%lu) addr=%lx size=%x", cur_ts, addr, size);
@@ -562,25 +559,6 @@ static void cosim_mmio_rw(CosimPciState *cosim, uint8_t bar, hwaddr addr,
 
         cpu_loop_exit(cpu);
     }
-
-#if 0
-
-    while (req->processing) {
-        //qemu_wait_io_event(cpu);
-        cpu_loop_exit(cpu);
-
-        /* in case an interrupt set this one again */
-        cpu->stopped = 1;
-
-        warn_report("cosim_mmio_rw: re-trying");
-    }
-
-    /*if (!write)*/
-    warn_report("cosim_mmio_rw: done (%lu)", qemu_clock_get_ns(COSIM_CLOCK));
-    //warn_report("cosim_mmio_rw: done");
-
-    *val = req->value;
-#endif
 }
 
 static uint64_t cosim_mmio_read(void *opaque, hwaddr addr, unsigned size)
@@ -802,17 +780,11 @@ static void pci_cosim_realize(PCIDevice *pdev, Error **errp)
                 &cosim_mmio_ops, &cosim->bar_info[i], label, len);
         pci_register_bar(pdev, i, attr, &cosim->mmio_bars[i]);
     }
-
-    /*qemu_thread_create(&cosim->thread, "cosim", cosim_comm_thread,
-                       cosim, QEMU_THREAD_JOINABLE);*/
 }
 
 static void pci_cosim_uninit(PCIDevice *pdev)
 {
     CosimPciState *cosim = COSIM_PCI(pdev);
-
-    /*cosim->stopping = true;
-    qemu_thread_join(&cosim->thread);*/
 
     free(cosim->reqs);
 
@@ -827,7 +799,6 @@ static void pci_cosim_uninit(PCIDevice *pdev)
 
 static void cosim_pci_instance_init(Object *obj)
 {
-    /*CosimPciState *cosim = COSIM_PCI(obj);*/
 }
 
 static Property cosim_pci_dev_properties[] = {
