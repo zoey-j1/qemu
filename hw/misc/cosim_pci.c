@@ -29,6 +29,7 @@
 #include "hw/qdev-properties.h"
 #include "hw/hw.h"
 #include "hw/pci/msi.h"
+#include "hw/pci/msix.h"
 #include "qemu/error-report.h"
 #include "qemu/timer.h"
 #include "qemu/main-loop.h" /* iothread mutex */
@@ -52,6 +53,7 @@ typedef struct CosimPciBarInfo {
     struct CosimPciState *cosim;
     uint8_t index;
     bool is_io;
+    bool is_dummy;
 } CosimPciBarInfo;
 
 typedef struct CosimPciRequest {
@@ -227,6 +229,13 @@ static void cosim_comm_d2h_interrupt(CosimPciState *cosim,
             return;
         }
         msi_notify(&cosim->pdev, interrupt->vector);
+    } else if (interrupt->inttype == COSIM_PCIE_PROTO_INT_MSIX) {
+        if (interrupt->vector >= cosim->dev_intro.pci_msix_nvecs) {
+            warn_report("cosim_comm_d2h_interrupt: invalid MSI-X vector (%u)",
+                    interrupt->vector);
+            return;
+        }
+        msix_notify(&cosim->pdev, interrupt->vector);
     } else {
         warn_report("cosim_comm_d2h_interrupt: not yet implented int type (%u)"
                 " TODO", interrupt->inttype);
@@ -614,6 +623,9 @@ static uint64_t cosim_mmio_read(void *opaque, hwaddr addr, unsigned size)
     CosimPciState *cosim = bar->cosim;
     uint64_t ret = 0;
 
+    if (bar->is_dummy)
+        return 0;
+
     cosim_mmio_rw(cosim, bar->index, addr, size, &ret, false);
 
     return ret;
@@ -624,6 +636,9 @@ static void cosim_mmio_write(void *opaque, hwaddr addr, uint64_t val,
 {
     CosimPciBarInfo *bar = opaque;
     CosimPciState *cosim = bar->cosim;
+
+    if (bar->is_dummy)
+        return;
 
     cosim_mmio_rw(cosim, bar->index, addr, size, &val, true);
 }
@@ -833,9 +848,27 @@ static void pci_cosim_realize(PCIDevice *pdev, Error **errp)
             attr = PCI_BASE_ADDRESS_SPACE_IO;
         }
 
+        if ((flags & COSIM_PCIE_PROTO_BAR_DUMMY))
+            cosim->bar_info[i].is_dummy = true;
+
         memory_region_init_io(&cosim->mmio_bars[i], OBJECT(cosim),
                 &cosim_mmio_ops, &cosim->bar_info[i], label, len);
         pci_register_bar(pdev, i, attr, &cosim->mmio_bars[i]);
+    }
+
+    if (cosim->dev_intro.pci_msix_nvecs > 0) {
+        /* TODO: MSI-X cap offset is hardcoded */
+        if (msix_init(pdev, cosim->dev_intro.pci_msix_nvecs,
+                &cosim->mmio_bars[cosim->dev_intro.pci_msix_table_bar],
+                cosim->dev_intro.pci_msix_table_bar,
+                cosim->dev_intro.pci_msix_table_offset,
+                &cosim->mmio_bars[cosim->dev_intro.pci_msix_pba_bar],
+                cosim->dev_intro.pci_msix_pba_bar,
+                cosim->dev_intro.pci_msix_pba_offset,
+                cosim->dev_intro.psi_msix_cap_offset, errp))
+        {
+            return;
+        }
     }
 }
 
