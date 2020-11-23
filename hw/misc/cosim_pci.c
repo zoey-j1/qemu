@@ -869,6 +869,13 @@ static void pci_cosim_realize(PCIDevice *pdev, Error **errp)
         {
             return;
         }
+
+        for (i = 0; i < cosim->dev_intro.pci_msix_nvecs; i++) {
+            if (msix_vector_use(pdev, i)) {
+                error_setg(errp, "cosim_connect: msix_vector_use failed");
+                return;
+            }
+        }
     }
 }
 
