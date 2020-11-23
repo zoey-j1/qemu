@@ -56,6 +56,7 @@ typedef struct CosimPciBarInfo {
 
 typedef struct CosimPciRequest {
     CPUState *cpu;          /* CPU associated with this request */
+    QemuCond cond;
     uint64_t addr;
     uint8_t bar;
     uint64_t value;         /* value read/to be written */
@@ -68,7 +69,7 @@ typedef struct CosimPciState {
     PCIDevice pdev;
 
     QemuThread thread;
-    bool stopping;
+    volatile bool stopping;
 
     CharBackend sim_chr;
 
@@ -98,6 +99,7 @@ typedef struct CosimPciState {
     CosimPciRequest *reqs;
 
     /* timers for synchronization etc. */
+    bool sync;
     uint64_t pci_latency;
     uint64_t sync_period;
     int64_t ts_base;
@@ -249,15 +251,19 @@ static void cosim_comm_d2h_rcomp(CosimPciState *cosim, uint64_t cur_ts,
 
     req->processing = false;
 
-    cpu = req->cpu;
+    if (cosim->sync) {
+        cpu = req->cpu;
 
 #ifdef DEBUG_PRINTS
-    warn_report("cosim_comm_d2h_rcomp: kicking cpu %lu ts=%lu",
-            req_id, cur_ts);
+        warn_report("cosim_comm_d2h_rcomp: kicking cpu %lu ts=%lu",
+                req_id, cur_ts);
 #endif
 
-    cpu->stopped = 0;
-    //qemu_cpu_kick(cpu);
+        cpu->stopped = 0;
+        //qemu_cpu_kick(cpu);
+    } else {
+        qemu_cond_broadcast(&req->cond);
+    }
 }
 
 /* process and complete message */
@@ -267,6 +273,9 @@ static void cosim_comm_d2h_process(CosimPciState *cosim, int64_t ts,
     uint8_t type;
 
     type = msg->dummy.own_type & COSIM_PCIE_PROTO_D2H_MSG_MASK;
+#ifdef DEBUG_PRINTS
+    warn_report("cosim_comm_d2h_process: ts=%ld type=%u", ts, type);
+#endif
 
     switch (type) {
         case COSIM_PCIE_PROTO_D2H_MSG_SYNC:
@@ -329,12 +338,11 @@ static int cosim_comm_d2h_peek(CosimPciState *cosim, int64_t ts,
 
     *pmsg = msg;
     *next_ts = msg_ts;
-    if (msg_ts > ts) {
+    if (cosim->sync && msg_ts > ts) {
         /* still in the future */
         return 1;
     }
 
-    *pmsg = msg;
     return 0;
 }
 
@@ -374,16 +382,20 @@ static void cosim_timer_poll(void *data)
     int ret;
 
     cur_ts = qemu_clock_get_ns(COSIM_CLOCK);
+#ifdef DEBUG_PRINTS
     if (cur_ts > cosim->poll_ts + 1 || cur_ts < cosim->poll_ts)
         warn_report("cosim_timer_poll: expected_ts=%lu cur_ts=%lu", cosim->poll_ts, cur_ts);
+#endif
 
     if (cur_ts > cosim->sync_ts + 1) {
+#ifdef DEBUG_PRINTS
         warn_report("cosim_timer_poll: triggering sync: ts=%ld sync_ts=%ld", cur_ts, timer_expire_time_ns(cosim->timer_sync));
+#endif
         cosim_trigger_sync(cosim, cur_ts);
     }
 
 #ifdef DEBUG_PRINTS
-    warn_report("cosim_timer_poll: ts=%ld sync_ts=%ld", cur_ts, timer_expire_time_ns(cosim->timer_sync), timer_pending(cosim->timer_sync), timer_expired(cosim->timer_sync, cur_ts));
+    warn_report("cosim_timer_poll: ts=%ld sync_ts=%ld", cur_ts, timer_expire_time_ns(cosim->timer_sync));
 #endif
 
     /* poll until we have a message */
@@ -434,22 +446,50 @@ static void cosim_timer_sync(void *data)
 
     cur_ts = qemu_clock_get_ns(COSIM_CLOCK);
 
+#ifdef DEBUG_PRINTS
     if (cur_ts > cosim->sync_ts + 1)
         warn_report("cosim_timer_sync: expected_ts=%lu cur_ts=%lu", cosim->sync_ts, cur_ts);
 
-#ifdef DEBUG_PRINTS
     warn_report("cosim_timer_sync: ts=%ld", cur_ts);
 #endif
 
     cosim_trigger_sync(cosim, cur_ts);
 
+#ifdef DEBUG_PRINTS
     int64_t now_ts = qemu_clock_get_ns(COSIM_CLOCK);
     if (cur_ts != now_ts)
         warn_report("cosim_timer_poll: time advanced from %lu to %lu", cur_ts, now_ts);
+#endif
 
     assert(cosim->sync_ts_bumped);
     timer_mod_ns(cosim->timer_sync, cosim->sync_ts);
     cosim->sync_ts_bumped = false;
+}
+
+static void *cosim_poll_thread(void *opaque)
+{
+    CosimPciState *cosim = opaque;
+    volatile union cosim_pcie_proto_d2h *msg;
+    int64_t next_ts;
+    int ret;
+
+    assert(!cosim->sync);
+
+    while (!cosim->stopping) {
+        ret = cosim_comm_d2h_peek(cosim, 0, &next_ts, &msg);
+        if (ret)
+            continue;
+
+        cosim_comm_d2h_next(cosim);
+
+        /* actually process the operation. this needs to be done with the I/O
+         * lock held. */
+        qemu_mutex_lock_iothread();
+        cosim_comm_d2h_process(cosim, 0, msg);
+        qemu_mutex_unlock_iothread();
+    }
+
+    return NULL;
 }
 
 /******************************************************************************/
@@ -551,13 +591,20 @@ static void cosim_mmio_rw(CosimPciState *cosim, uint8_t bar, hwaddr addr,
         req->bar = bar;
         req->size = size;
 
-        cpu->stopped = 1;
-
 #ifdef DEBUG_PRINTS
         warn_report("cosim_mmio_rw: starting wait for read (%lu) addr=%lx size=%x", cur_ts, addr, size);
 #endif
 
-        cpu_loop_exit(cpu);
+        if (cosim->sync) {
+            cpu->stopped = 1;
+            cpu_loop_exit(cpu);
+        } else {
+            while (req->processing)
+                qemu_cond_wait_iothread(&req->cond);
+
+            *val = req->value;
+            req->requested = false;
+        }
     }
 }
 
@@ -613,7 +660,9 @@ static int cosim_connect(CosimPciState *cosim, Error **errp)
 
     /* send host intro */
     memset(&host_intro, 0, sizeof(host_intro));
-    host_intro.flags = COSIM_PCIE_PROTO_FLAGS_HI_SYNC;
+
+    if (cosim->sync)
+        host_intro.flags = COSIM_PCIE_PROTO_FLAGS_HI_SYNC;
 
     len = sizeof(host_intro);
     off = 0;
@@ -649,9 +698,11 @@ static int cosim_connect(CosimPciState *cosim, Error **errp)
 
     }
 
-    if (!(d_i->flags & COSIM_PCIE_PROTO_FLAGS_DI_SYNC)) {
-        error_setg(errp, "cosim_connect: sync not reciprocated");
-        return 0;
+    if (cosim->sync) {
+        if (!(d_i->flags & COSIM_PCIE_PROTO_FLAGS_DI_SYNC)) {
+            error_setg(errp, "cosim_connect: sync not reciprocated");
+            return 0;
+        }
     }
 
     /* get shared memory fd */
@@ -698,17 +749,23 @@ static int cosim_connect(CosimPciState *cosim, Error **errp)
     cosim->reqs = calloc(cosim->reqs_len, sizeof(*cosim->reqs));
     CPU_FOREACH(cpu) {
         cosim->reqs[cpu->cpu_index].cpu = cpu;
+        qemu_cond_init(&cosim->reqs[cpu->cpu_index].cond);
     }
 
-    cosim->timer_dummy = timer_new_ns(COSIM_CLOCK, cosim_timer_dummy, cosim);
+    if (cosim->sync) {
+        cosim->timer_dummy = timer_new_ns(COSIM_CLOCK, cosim_timer_dummy, cosim);
 
-    cosim->ts_base = qemu_clock_get_ns(COSIM_CLOCK);
-    cosim->timer_sync = timer_new_ns(COSIM_CLOCK, cosim_timer_sync, cosim);
-    cosim->sync_ts = cosim->ts_base;
-    timer_mod_ns(cosim->timer_sync, cosim->ts_base);
-    cosim->poll_ts = cosim->ts_base + 1;
-    cosim->timer_poll = timer_new_ns(COSIM_CLOCK, cosim_timer_poll, cosim);
-    timer_mod_ns(cosim->timer_poll, cosim->ts_base + 1);
+        cosim->ts_base = qemu_clock_get_ns(COSIM_CLOCK);
+        cosim->timer_sync = timer_new_ns(COSIM_CLOCK, cosim_timer_sync, cosim);
+        cosim->sync_ts = cosim->ts_base;
+        timer_mod_ns(cosim->timer_sync, cosim->ts_base);
+        cosim->poll_ts = cosim->ts_base + 1;
+        cosim->timer_poll = timer_new_ns(COSIM_CLOCK, cosim_timer_poll, cosim);
+        timer_mod_ns(cosim->timer_poll, cosim->ts_base + 1);
+    } else {
+        qemu_thread_create(&cosim->thread, "cosim-poll", cosim_poll_thread,
+                cosim, QEMU_THREAD_JOINABLE);
+    }
 
     /* set vendor, device, revision, and class id */
     pci_config_set_vendor_id(pci_conf, d_i->pci_vendor_id);
@@ -785,13 +842,26 @@ static void pci_cosim_realize(PCIDevice *pdev, Error **errp)
 static void pci_cosim_uninit(PCIDevice *pdev)
 {
     CosimPciState *cosim = COSIM_PCI(pdev);
+    CPUState *cpu;
 
+    if (!cosim->sync) {
+        cosim->stopping = true;
+        qemu_thread_join(&cosim->thread);
+    }
+
+    CPU_FOREACH(cpu) {
+        qemu_cond_destroy(&cosim->reqs[cpu->cpu_index].cond);
+    }
     free(cosim->reqs);
 
-    timer_del(cosim->timer_sync);
-    timer_free(cosim->timer_sync);
-    timer_del(cosim->timer_poll);
-    timer_free(cosim->timer_poll);
+    if (cosim->sync) {
+        timer_del(cosim->timer_dummy);
+        timer_free(cosim->timer_dummy);
+        timer_del(cosim->timer_sync);
+        timer_free(cosim->timer_sync);
+        timer_del(cosim->timer_poll);
+        timer_free(cosim->timer_poll);
+    }
 
     if (cosim->dev_intro.pci_msi_nvecs > 0)
         msi_uninit(pdev);
@@ -803,6 +873,7 @@ static void cosim_pci_instance_init(Object *obj)
 
 static Property cosim_pci_dev_properties[] = {
   DEFINE_PROP_CHR("chardev", CosimPciState, sim_chr),
+  DEFINE_PROP_BOOL("sync", CosimPciState, sync, false),
   DEFINE_PROP_UINT64("pci-latency", CosimPciState, pci_latency, 500),
   DEFINE_PROP_UINT64("sync-period", CosimPciState, sync_period, 500),
   DEFINE_PROP_END_OF_LIST(),
