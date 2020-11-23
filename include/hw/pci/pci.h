@@ -862,4 +862,9 @@ extern const VMStateDescription vmstate_pci_device;
 
 MSIMessage pci_get_msi_message(PCIDevice *dev, int vector);
 
+static inline int pci_irq_disabled(PCIDevice *d)
+{
+    return pci_get_word(d->config + PCI_COMMAND) & PCI_COMMAND_INTX_DISABLE;
+}
+
 #endif
