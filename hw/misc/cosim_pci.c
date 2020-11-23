@@ -150,12 +150,12 @@ static volatile union cosim_pcie_proto_h2d *cosim_comm_h2d_alloc(
     pos = cosim->h2d_base + (cosim->h2d_elen * cosim->h2d_pos);
     msg = (volatile union cosim_pcie_proto_h2d *) pos;
 
-    if ((msg->dummy.own_type & COSIM_PCIE_PROTO_H2D_OWN_MASK) !=
+    while ((msg->dummy.own_type & COSIM_PCIE_PROTO_H2D_OWN_MASK) !=
             COSIM_PCIE_PROTO_H2D_OWN_HOST)
     {
-        /* this should never happen as we synchronously submit requests
-         * one-by-one. */
-        panic("cosim_comm_h2d_alloc: ran into non-owned entry in h2d queue");
+#ifdef DEBUG_PRINTS
+        warn_report("cosim_comm_h2d_alloc: ran into non-owned entry in h2d queue");
+#endif
     }
 
     /* tag message with timestamp */
