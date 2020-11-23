@@ -654,6 +654,48 @@ static const MemoryRegionOps cosim_mmio_ops = {
 };
 
 
+static void cosim_config_write(PCIDevice *dev, uint32_t address, uint32_t val,
+        int len)
+{
+    CosimPciState *cosim = COSIM_PCI(dev);
+    volatile union cosim_pcie_proto_h2d *msg;
+    volatile struct cosim_pcie_proto_h2d_devctrl *devctrl;
+    bool intx_before, intx_after;
+    bool msi_before, msi_after;
+    bool msix_before, msix_after;
+
+    intx_before = !pci_irq_disabled(dev);
+    msi_before = msi_enabled(dev);
+    msix_before = msix_enabled(dev);
+
+    pci_default_write_config(dev, address, val, len);
+
+    intx_after = !pci_irq_disabled(dev);
+    msi_after = msi_enabled(dev);
+    msix_after = msix_enabled(dev);
+
+    if (intx_before != intx_after || msi_before != msi_after ||
+            msix_before != msix_after)
+    {
+        msg = cosim_comm_h2d_alloc(cosim, qemu_clock_get_ns(COSIM_CLOCK));
+        devctrl = &msg->devctrl;
+
+        devctrl->flags = 0;
+        if (intx_after)
+            devctrl->flags |= COSIM_PCIE_PROTO_CTRL_INTX_EN;
+        if (msi_after)
+            devctrl->flags |= COSIM_PCIE_PROTO_CTRL_MSI_EN;
+        if (msix_after)
+            devctrl->flags |= COSIM_PCIE_PROTO_CTRL_MSIX_EN;
+
+        smp_wmb(); /* barrier to make sure earlier fields are written before
+                      handing over ownership */
+
+        devctrl->own_type = COSIM_PCIE_PROTO_H2D_MSG_DEVCTRL |
+            COSIM_PCIE_PROTO_H2D_OWN_DEV;
+    }
+}
+
 
 /******************************************************************************/
 /* Initialization */
@@ -928,6 +970,7 @@ static void cosim_pci_class_init(ObjectClass *class, void *data)
 
     k->realize = pci_cosim_realize;
     k->exit = pci_cosim_uninit;
+    k->config_write = cosim_config_write;
 
     /* TODO: how can we parametrize these? */
     k->vendor_id = 0x10EE; /* xilinx */
