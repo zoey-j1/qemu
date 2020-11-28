@@ -159,7 +159,11 @@ int64_t icount_get(void)
 
 int64_t icount_to_ns(int64_t icount)
 {
-    return icount << qatomic_read(&timers_state.icount_time_shift);
+    int16_t shift = qatomic_read(&timers_state.icount_time_shift);
+    if (shift >= 0)
+        return icount << shift;
+    else
+        return icount >> -shift;
 }
 
 /*
@@ -232,7 +236,10 @@ static void icount_adjust_vm(void *opaque)
 int64_t icount_round(int64_t count)
 {
     int shift = qatomic_read(&timers_state.icount_time_shift);
-    return (count + (1 << shift) - 1) >> shift;
+    if (shift >= 0)
+        return (count + (1 << shift) - 1) >> shift;
+    else
+        return count;
 }
 
 static void icount_warp_rt(void)
@@ -423,6 +430,7 @@ void icount_configure(QemuOpts *opts, Error **errp)
     bool sleep = qemu_opt_get_bool(opts, "sleep", true);
     bool align = qemu_opt_get_bool(opts, "align", false);
     long time_shift = -1;
+    bool time_shift_set = false;
 
     if (!option) {
         if (qemu_opt_get(opts, "align") != NULL) {
@@ -438,10 +446,12 @@ void icount_configure(QemuOpts *opts, Error **errp)
 
     if (strcmp(option, "auto") != 0) {
         if (qemu_strtol(option, NULL, 0, &time_shift) < 0
-            || time_shift < 0 || time_shift > MAX_ICOUNT_SHIFT) {
+            || time_shift > MAX_ICOUNT_SHIFT) {
             error_setg(errp, "icount: Invalid shift value");
             return;
         }
+        warn_report("time_shift=%ld", time_shift);
+        time_shift_set = true;
     } else if (icount_align_option) {
         error_setg(errp, "shift=auto and align=on are incompatible");
         return;
@@ -458,7 +468,7 @@ void icount_configure(QemuOpts *opts, Error **errp)
 
     icount_align_option = align;
 
-    if (time_shift >= 0) {
+    if (time_shift_set) {
         timers_state.icount_time_shift = time_shift;
         icount_enable_precise();
         return;
