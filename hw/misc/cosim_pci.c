@@ -67,6 +67,9 @@ typedef struct CosimPciRequest {
     bool requested;
 } CosimPciRequest;
 
+#define SYNC_MODES   0
+#define SYNC_BARRIER 1
+
 typedef struct CosimPciState {
     PCIDevice pdev;
 
@@ -102,6 +105,7 @@ typedef struct CosimPciState {
 
     /* timers for synchronization etc. */
     bool sync;
+    int sync_mode;
     uint64_t pci_latency;
     uint64_t sync_period;
     int64_t ts_base;
@@ -162,8 +166,10 @@ static volatile union cosim_pcie_proto_h2d *cosim_comm_h2d_alloc(
     msg->dummy.timestamp = ts_to_proto(cosim, ts + cosim->pci_latency);
 
     /* re-arm sync timer */
-    cosim->sync_ts = ts + cosim->sync_period;
-    cosim->sync_ts_bumped = true;
+    if (cosim->sync_mode == SYNC_MODES) {
+        cosim->sync_ts = ts + cosim->sync_period;
+        cosim->sync_ts_bumped = true;
+    }
 
 #ifdef DEBUG_PRINTS
     warn_report("cosim_comm_h2d_alloc: ts=%lu msg_ts=%lu next=%ld", ts,
@@ -470,6 +476,10 @@ static void cosim_timer_sync(void *data)
         warn_report("cosim_timer_poll: time advanced from %lu to %lu", cur_ts, now_ts);
 #endif
 
+    if (cosim->sync_mode == SYNC_BARRIER) {
+        cosim->sync_ts = cur_ts + cosim->sync_period;
+        cosim->sync_ts_bumped = true;
+    }
     assert(cosim->sync_ts_bumped);
     timer_mod_ns(cosim->timer_sync, cosim->sync_ts);
     cosim->sync_ts_bumped = false;
@@ -956,6 +966,7 @@ static void cosim_pci_instance_init(Object *obj)
 static Property cosim_pci_dev_properties[] = {
   DEFINE_PROP_CHR("chardev", CosimPciState, sim_chr),
   DEFINE_PROP_BOOL("sync", CosimPciState, sync, false),
+  DEFINE_PROP_INT32("sync-mode", CosimPciState, sync_mode, SYNC_MODES),
   DEFINE_PROP_UINT64("pci-latency", CosimPciState, pci_latency, 500),
   DEFINE_PROP_UINT64("sync-period", CosimPciState, sync_period, 500),
   DEFINE_PROP_END_OF_LIST(),
