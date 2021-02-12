@@ -40,7 +40,7 @@
 #include "sysemu/cpus.h"
 #include "hw/core/cpu.h"
 
-#include <cosim_pcie_proto.h>
+#include <simbricks/proto/pcie.h>
 
 //#define DEBUG_PRINTS
 
