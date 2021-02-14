@@ -40,6 +40,7 @@
 #include "sysemu/cpus.h"
 #include "hw/core/cpu.h"
 
+#include <simbricks/proto/base.h>
 #include <simbricks/proto/pcie.h>
 
 //#define DEBUG_PRINTS
@@ -166,7 +167,7 @@ static volatile union SimbricksProtoPcieH2D *cosim_comm_h2d_alloc(
     msg->dummy.timestamp = ts_to_proto(cosim, ts + cosim->pci_latency);
 
     /* re-arm sync timer */
-    if (cosim->sync_mode == SYNC_MODES) {
+    if (cosim->sync_mode == SIMBRICKS_PROTO_SYNC_SIMBRICKS) {
         cosim->sync_ts = ts + cosim->sync_period;
         cosim->sync_ts_bumped = true;
     }
@@ -477,7 +478,7 @@ static void cosim_timer_sync(void *data)
         warn_report("cosim_timer_poll: time advanced from %lu to %lu", cur_ts, now_ts);
 #endif
 
-    if (cosim->sync_mode == SYNC_BARRIER) {
+    if (cosim->sync_mode == SIMBRICKS_PROTO_SYNC_BARRIER) {
         cosim->sync_ts = cur_ts + cosim->sync_period;
         cosim->sync_ts_bumped = true;
     }
@@ -967,7 +968,8 @@ static void cosim_pci_instance_init(Object *obj)
 static Property cosim_pci_dev_properties[] = {
   DEFINE_PROP_CHR("chardev", CosimPciState, sim_chr),
   DEFINE_PROP_BOOL("sync", CosimPciState, sync, false),
-  DEFINE_PROP_INT32("sync-mode", CosimPciState, sync_mode, SYNC_MODES),
+  DEFINE_PROP_INT32("sync-mode", CosimPciState, sync_mode,
+      SIMBRICKS_PROTO_SYNC_SIMBRICKS),
   DEFINE_PROP_UINT64("pci-latency", CosimPciState, pci_latency, 500),
   DEFINE_PROP_UINT64("sync-period", CosimPciState, sync_period, 500),
   DEFINE_PROP_END_OF_LIST(),
