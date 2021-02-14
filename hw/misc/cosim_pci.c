@@ -81,7 +81,7 @@ typedef struct CosimPciState {
     MemoryRegion mmio_bars[6];
     CosimPciBarInfo bar_info[6];
 
-    struct cosim_pcie_proto_dev_intro dev_intro;
+    struct SimbricksProtoPcieDevIntro dev_intro;
 
     void *shm_base;
     size_t shm_len;
@@ -145,17 +145,17 @@ static inline int64_t ts_from_proto(CosimPciState *cosim, uint64_t proto_ts)
 /******************************************************************************/
 /* Worker thread */
 
-static volatile union cosim_pcie_proto_h2d *cosim_comm_h2d_alloc(
+static volatile union SimbricksProtoPcieH2D *cosim_comm_h2d_alloc(
         CosimPciState *cosim, int64_t ts)
 {
     uint8_t *pos;
-    volatile union cosim_pcie_proto_h2d *msg;
+    volatile union SimbricksProtoPcieH2D *msg;
 
     pos = cosim->h2d_base + (cosim->h2d_elen * cosim->h2d_pos);
-    msg = (volatile union cosim_pcie_proto_h2d *) pos;
+    msg = (volatile union SimbricksProtoPcieH2D *) pos;
 
-    while ((msg->dummy.own_type & COSIM_PCIE_PROTO_H2D_OWN_MASK) !=
-            COSIM_PCIE_PROTO_H2D_OWN_HOST)
+    while ((msg->dummy.own_type & SIMBRICKS_PROTO_PCIE_H2D_OWN_MASK) !=
+            SIMBRICKS_PROTO_PCIE_H2D_OWN_HOST)
     {
 #ifdef DEBUG_PRINTS
         warn_report("cosim_comm_h2d_alloc: ran into non-owned entry in h2d queue");
@@ -183,10 +183,10 @@ static volatile union cosim_pcie_proto_h2d *cosim_comm_h2d_alloc(
 }
 
 static void cosim_comm_d2h_dma_read(CosimPciState *cosim, int64_t ts,
-        volatile struct cosim_pcie_proto_d2h_read *read)
+        volatile struct SimbricksProtoPcieD2HRead *read)
 {
-    volatile union cosim_pcie_proto_h2d *h2d;
-    volatile struct cosim_pcie_proto_h2d_readcomp *rc;
+    volatile union SimbricksProtoPcieH2D *h2d;
+    volatile struct SimbricksProtoPcieH2DReadcomp *rc;
 
     /* allocate completion */
     h2d = cosim_comm_h2d_alloc(cosim, ts);
@@ -200,15 +200,15 @@ static void cosim_comm_d2h_dma_read(CosimPciState *cosim, int64_t ts,
     /* return completion */
     rc->req_id = read->req_id;
     smp_wmb();
-    rc->own_type = COSIM_PCIE_PROTO_H2D_MSG_READCOMP |
-        COSIM_PCIE_PROTO_H2D_OWN_DEV;
+    rc->own_type = SIMBRICKS_PROTO_PCIE_H2D_MSG_READCOMP |
+        SIMBRICKS_PROTO_PCIE_H2D_OWN_DEV;
 }
 
 static void cosim_comm_d2h_dma_write(CosimPciState *cosim, int64_t ts,
-        volatile struct cosim_pcie_proto_d2h_write *write)
+        volatile struct SimbricksProtoPcieD2HWrite *write)
 {
-    volatile union cosim_pcie_proto_h2d *h2d;
-    volatile struct cosim_pcie_proto_h2d_writecomp *wc;
+    volatile union SimbricksProtoPcieH2D *h2d;
+    volatile struct SimbricksProtoPcieH2DWritecomp *wc;
 
     /* allocate completion */
     h2d = cosim_comm_h2d_alloc(cosim, ts);
@@ -221,21 +221,21 @@ static void cosim_comm_d2h_dma_write(CosimPciState *cosim, int64_t ts,
     /* return completion */
     wc->req_id = write->req_id;
     smp_wmb();
-    wc->own_type = COSIM_PCIE_PROTO_H2D_MSG_WRITECOMP |
-        COSIM_PCIE_PROTO_H2D_OWN_DEV;
+    wc->own_type = SIMBRICKS_PROTO_PCIE_H2D_MSG_WRITECOMP |
+        SIMBRICKS_PROTO_PCIE_H2D_OWN_DEV;
 }
 
 static void cosim_comm_d2h_interrupt(CosimPciState *cosim,
-        volatile struct cosim_pcie_proto_d2h_interrupt *interrupt)
+        volatile struct SimbricksProtoPcieD2HInterrupt *interrupt)
 {
-    if (interrupt->inttype == COSIM_PCIE_PROTO_INT_MSI) {
+    if (interrupt->inttype == SIMBRICKS_PROTO_PCIE_INT_MSI) {
         if (interrupt->vector >= 32) {
             warn_report("cosim_comm_d2h_interrupt: invalid MSI vector (%u)",
                     interrupt->vector);
             return;
         }
         msi_notify(&cosim->pdev, interrupt->vector);
-    } else if (interrupt->inttype == COSIM_PCIE_PROTO_INT_MSIX) {
+    } else if (interrupt->inttype == SIMBRICKS_PROTO_PCIE_INT_MSIX) {
         if (interrupt->vector >= cosim->dev_intro.pci_msix_nvecs) {
             warn_report("cosim_comm_d2h_interrupt: invalid MSI-X vector (%u)",
                     interrupt->vector);
@@ -283,38 +283,38 @@ static void cosim_comm_d2h_rcomp(CosimPciState *cosim, uint64_t cur_ts,
 
 /* process and complete message */
 static void cosim_comm_d2h_process(CosimPciState *cosim, int64_t ts,
-        volatile union cosim_pcie_proto_d2h *msg)
+        volatile union SimbricksProtoPcieD2H *msg)
 {
     uint8_t type;
 
-    type = msg->dummy.own_type & COSIM_PCIE_PROTO_D2H_MSG_MASK;
+    type = msg->dummy.own_type & SIMBRICKS_PROTO_PCIE_D2H_MSG_MASK;
 #ifdef DEBUG_PRINTS
     warn_report("cosim_comm_d2h_process: ts=%ld type=%u", ts, type);
 #endif
 
     switch (type) {
-        case COSIM_PCIE_PROTO_D2H_MSG_SYNC:
+        case SIMBRICKS_PROTO_PCIE_D2H_MSG_SYNC:
             /* nop */
             break;
 
-        case COSIM_PCIE_PROTO_D2H_MSG_READ:
+        case SIMBRICKS_PROTO_PCIE_D2H_MSG_READ:
             cosim_comm_d2h_dma_read(cosim, ts, &msg->read);
             break;
 
-        case COSIM_PCIE_PROTO_D2H_MSG_WRITE:
+        case SIMBRICKS_PROTO_PCIE_D2H_MSG_WRITE:
             cosim_comm_d2h_dma_write(cosim, ts, &msg->write);
             break;
 
-        case COSIM_PCIE_PROTO_D2H_MSG_INTERRUPT:
+        case SIMBRICKS_PROTO_PCIE_D2H_MSG_INTERRUPT:
             cosim_comm_d2h_interrupt(cosim, &msg->interrupt);
             break;
 
-        case COSIM_PCIE_PROTO_D2H_MSG_READCOMP:
+        case SIMBRICKS_PROTO_PCIE_D2H_MSG_READCOMP:
             cosim_comm_d2h_rcomp(cosim, ts, msg->readcomp.req_id,
                     (void *) msg->readcomp.data);
             break;
 
-        case COSIM_PCIE_PROTO_D2H_MSG_WRITECOMP:
+        case SIMBRICKS_PROTO_PCIE_D2H_MSG_WRITECOMP:
             /* we treat writes as posted, so nothing we need to do here */
             break;
 
@@ -325,24 +325,25 @@ static void cosim_comm_d2h_process(CosimPciState *cosim, int64_t ts,
     smp_wmb();
 
     /* mark message as done */
-    msg->dummy.own_type = (msg->dummy.own_type & COSIM_PCIE_PROTO_D2H_MSG_MASK) |
-        COSIM_PCIE_PROTO_D2H_OWN_DEV;
+    msg->dummy.own_type =
+        (msg->dummy.own_type & SIMBRICKS_PROTO_PCIE_D2H_MSG_MASK) |
+        SIMBRICKS_PROTO_PCIE_D2H_OWN_DEV;
 }
 
 /* peek at head of d2h queue */
 static int cosim_comm_d2h_peek(CosimPciState *cosim, int64_t ts,
-        int64_t *next_ts, volatile union cosim_pcie_proto_d2h **pmsg)
+        int64_t *next_ts, volatile union SimbricksProtoPcieD2H **pmsg)
 {
     uint8_t *pos;
     int64_t msg_ts;
-    volatile union cosim_pcie_proto_d2h *msg;
+    volatile union SimbricksProtoPcieD2H *msg;
 
     pos = cosim->d2h_base + (cosim->d2h_elen * cosim->d2h_pos);
-    msg = (volatile union cosim_pcie_proto_d2h *) pos;
+    msg = (volatile union SimbricksProtoPcieD2H *) pos;
 
     /* check if this message is ready for us */
-    if ((msg->dummy.own_type & COSIM_PCIE_PROTO_D2H_OWN_MASK) !=
-        COSIM_PCIE_PROTO_D2H_OWN_HOST)
+    if ((msg->dummy.own_type & SIMBRICKS_PROTO_PCIE_D2H_OWN_MASK) !=
+        SIMBRICKS_PROTO_PCIE_D2H_OWN_HOST)
     {
         return -1;
     }
@@ -370,8 +371,8 @@ static void cosim_comm_d2h_next(CosimPciState *cosim)
 
 static void cosim_trigger_sync(CosimPciState *cosim, int64_t cur_ts)
 {
-    volatile union cosim_pcie_proto_h2d *msg;
-    volatile struct cosim_pcie_proto_h2d_sync *sy;
+    volatile union SimbricksProtoPcieH2D *msg;
+    volatile struct SimbricksProtoPcieH2DSync *sy;
 
     msg = cosim_comm_h2d_alloc(cosim, cur_ts);
     sy = &msg->sync;
@@ -379,7 +380,7 @@ static void cosim_trigger_sync(CosimPciState *cosim, int64_t cur_ts)
     smp_wmb(); /* barrier to make sure earlier fields are written before
                   handing over ownership */
 
-    sy->own_type = COSIM_PCIE_PROTO_H2D_MSG_SYNC | COSIM_PCIE_PROTO_H2D_OWN_DEV;
+    sy->own_type = SIMBRICKS_PROTO_PCIE_H2D_MSG_SYNC | SIMBRICKS_PROTO_PCIE_H2D_OWN_DEV;
 
     /* cosim_comm_h2d_alloc has already re-scheduled the timer */
 }
@@ -391,8 +392,8 @@ static void cosim_timer_dummy(void *data)
 static void cosim_timer_poll(void *data)
 {
     CosimPciState *cosim = data;
-    volatile union cosim_pcie_proto_d2h *msg;
-    volatile union cosim_pcie_proto_d2h *next_msg;
+    volatile union SimbricksProtoPcieD2H *msg;
+    volatile union SimbricksProtoPcieD2H *next_msg;
     int64_t cur_ts, next_ts;
     int ret;
 
@@ -488,7 +489,7 @@ static void cosim_timer_sync(void *data)
 static void *cosim_poll_thread(void *opaque)
 {
     CosimPciState *cosim = opaque;
-    volatile union cosim_pcie_proto_d2h *msg;
+    volatile union SimbricksProtoPcieD2H *msg;
     int64_t next_ts;
     int ret;
 
@@ -521,9 +522,9 @@ static void cosim_mmio_rw(CosimPciState *cosim, uint8_t bar, hwaddr addr,
 {
     CPUState *cpu = current_cpu;
     CosimPciRequest *req;
-    volatile union cosim_pcie_proto_h2d *msg;
-    volatile struct cosim_pcie_proto_h2d_read *read;
-    volatile struct cosim_pcie_proto_h2d_write *write;
+    volatile union SimbricksProtoPcieH2D *msg;
+    volatile struct SimbricksProtoPcieH2DRead *read;
+    volatile struct SimbricksProtoPcieH2DWrite *write;
     int64_t cur_ts;
 
     assert(cosim->reqs_len > cpu->cpu_index);
@@ -577,8 +578,8 @@ static void cosim_mmio_rw(CosimPciState *cosim, uint8_t bar, hwaddr addr,
         smp_wmb(); /* barrier to make sure earlier fields are written before
                       handing over ownership */
 
-        write->own_type = COSIM_PCIE_PROTO_H2D_MSG_WRITE |
-            COSIM_PCIE_PROTO_H2D_OWN_DEV;
+        write->own_type = SIMBRICKS_PROTO_PCIE_H2D_MSG_WRITE |
+            SIMBRICKS_PROTO_PCIE_H2D_OWN_DEV;
 
 #ifdef DEBUG_PRINTS
         warn_report("cosim_mmio_rw: finished write (%lu) addr=%lx size=%x val=%lx",
@@ -598,8 +599,8 @@ static void cosim_mmio_rw(CosimPciState *cosim, uint8_t bar, hwaddr addr,
         smp_wmb(); /* barrier to make sure earlier fields are written before
                       handing over ownership */
 
-        read->own_type = COSIM_PCIE_PROTO_H2D_MSG_READ |
-            COSIM_PCIE_PROTO_H2D_OWN_DEV;
+        read->own_type = SIMBRICKS_PROTO_PCIE_H2D_MSG_READ |
+            SIMBRICKS_PROTO_PCIE_H2D_OWN_DEV;
 
         /* start processing request */
         req->processing = true;
@@ -668,8 +669,8 @@ static void cosim_config_write(PCIDevice *dev, uint32_t address, uint32_t val,
         int len)
 {
     CosimPciState *cosim = COSIM_PCI(dev);
-    volatile union cosim_pcie_proto_h2d *msg;
-    volatile struct cosim_pcie_proto_h2d_devctrl *devctrl;
+    volatile union SimbricksProtoPcieH2D *msg;
+    volatile struct SimbricksProtoPcieH2DDevctrl *devctrl;
     bool intx_before, intx_after;
     bool msi_before, msi_after;
     bool msix_before, msix_after;
@@ -692,17 +693,17 @@ static void cosim_config_write(PCIDevice *dev, uint32_t address, uint32_t val,
 
         devctrl->flags = 0;
         if (intx_after)
-            devctrl->flags |= COSIM_PCIE_PROTO_CTRL_INTX_EN;
+            devctrl->flags |= SIMBRICKS_PROTO_PCIE_CTRL_INTX_EN;
         if (msi_after)
-            devctrl->flags |= COSIM_PCIE_PROTO_CTRL_MSI_EN;
+            devctrl->flags |= SIMBRICKS_PROTO_PCIE_CTRL_MSI_EN;
         if (msix_after)
-            devctrl->flags |= COSIM_PCIE_PROTO_CTRL_MSIX_EN;
+            devctrl->flags |= SIMBRICKS_PROTO_PCIE_CTRL_MSIX_EN;
 
         smp_wmb(); /* barrier to make sure earlier fields are written before
                       handing over ownership */
 
-        devctrl->own_type = COSIM_PCIE_PROTO_H2D_MSG_DEVCTRL |
-            COSIM_PCIE_PROTO_H2D_OWN_DEV;
+        devctrl->own_type = SIMBRICKS_PROTO_PCIE_H2D_MSG_DEVCTRL |
+            SIMBRICKS_PROTO_PCIE_H2D_OWN_DEV;
     }
 }
 
@@ -712,8 +713,8 @@ static void cosim_config_write(PCIDevice *dev, uint32_t address, uint32_t val,
 
 static int cosim_connect(CosimPciState *cosim, Error **errp)
 {
-    struct cosim_pcie_proto_dev_intro *d_i = &cosim->dev_intro;
-    struct cosim_pcie_proto_host_intro host_intro;
+    struct SimbricksProtoPcieDevIntro *d_i = &cosim->dev_intro;
+    struct SimbricksProtoPcieHostIntro host_intro;
     struct stat statbuf;
     int ret, off, len;
     CPUState *cpu;
@@ -729,7 +730,7 @@ static int cosim_connect(CosimPciState *cosim, Error **errp)
     memset(&host_intro, 0, sizeof(host_intro));
 
     if (cosim->sync)
-        host_intro.flags = COSIM_PCIE_PROTO_FLAGS_HI_SYNC;
+        host_intro.flags = SIMBRICKS_PROTO_PCIE_FLAGS_HI_SYNC;
 
     len = sizeof(host_intro);
     off = 0;
@@ -766,7 +767,7 @@ static int cosim_connect(CosimPciState *cosim, Error **errp)
     }
 
     if (cosim->sync) {
-        if (!(d_i->flags & COSIM_PCIE_PROTO_FLAGS_DI_SYNC)) {
+        if (!(d_i->flags & SIMBRICKS_PROTO_PCIE_FLAGS_DI_SYNC)) {
             error_setg(errp, "cosim_connect: sync not reciprocated");
             return 0;
         }
@@ -878,17 +879,17 @@ static void pci_cosim_realize(PCIDevice *pdev, Error **errp)
         cosim->bar_info[i].cosim = cosim;
         cosim->bar_info[i].index = i;
 
-        if (!(flags & COSIM_PCIE_PROTO_BAR_IO)) {
+        if (!(flags & SIMBRICKS_PROTO_PCIE_BAR_IO)) {
             /* memory bar */
             cosim->bar_info[i].is_io = false;
 
             attr = PCI_BASE_ADDRESS_SPACE_MEMORY;
-            if ((flags & COSIM_PCIE_PROTO_BAR_64)) {
+            if ((flags & SIMBRICKS_PROTO_PCIE_BAR_64)) {
                 attr |= PCI_BASE_ADDRESS_MEM_TYPE_64;
             } else {
                 attr |= PCI_BASE_ADDRESS_MEM_TYPE_32;
             }
-            if ((flags & COSIM_PCIE_PROTO_BAR_PF)) {
+            if ((flags & SIMBRICKS_PROTO_PCIE_BAR_PF)) {
                 attr |= PCI_BASE_ADDRESS_MEM_PREFETCH;
             }
             label = "cosim-bar-mmio";
@@ -900,7 +901,7 @@ static void pci_cosim_realize(PCIDevice *pdev, Error **errp)
             attr = PCI_BASE_ADDRESS_SPACE_IO;
         }
 
-        if ((flags & COSIM_PCIE_PROTO_BAR_DUMMY))
+        if ((flags & SIMBRICKS_PROTO_PCIE_BAR_DUMMY))
             cosim->bar_info[i].is_dummy = true;
 
         memory_region_init_io(&cosim->mmio_bars[i], OBJECT(cosim),
