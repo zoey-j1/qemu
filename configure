@@ -449,7 +449,7 @@ meson=""
 ninja=""
 skip_meson=no
 gettext=""
-cosim_pci="no"
+simbricks_pci="no"
 
 bogus_os="no"
 malloc_trim="auto"
@@ -1512,9 +1512,9 @@ for opt do
   ;;
   --disable-fuzzing) fuzzing=no
   ;;
-  --disable-cosim-pci) cosim_pci="no"
+  --disable-simbricks-pci) simbricks_pci="no"
   ;;
-  --enable-cosim-pci) cosim_pci="yes"
+  --enable-simbricks-pci) simbricks_pci="yes"
   ;;
   --gdb=*) gdb_bin="$optarg"
   ;;
@@ -1855,7 +1855,7 @@ disabled with --disable-FEATURE, default is enabled if available:
   xkbcommon       xkbcommon support
   rng-none        dummy RNG, avoid using /dev/(u)random and getrandom()
   libdaxctl       libdaxctl support
-  cosim-pci       PCI cosimulator support
+  simbricks-pci   Simbricks PCIe device adapter support
 
 NOTE: The object files are built at the place where configure is launched
 EOF
@@ -6697,8 +6697,8 @@ fi
 if test "$have_mlockall" = "yes" ; then
   echo "HAVE_MLOCKALL=y" >> $config_host_mak
 fi
-if test "$cosim_pci" = "yes" ; then
-  echo "CONFIG_COSIM_PCI=y" >> $config_host_mak
+if test "$simbricks_pci" = "yes" ; then
+  echo "CONFIG_SIMBRICKS_PCI=y" >> $config_host_mak
 fi
 if test "$fuzzing" = "yes" ; then
   # If LIB_FUZZING_ENGINE is set, assume we are running on OSS-Fuzz, and the
