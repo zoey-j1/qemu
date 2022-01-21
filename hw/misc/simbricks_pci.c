@@ -883,6 +883,7 @@ static int simbricks_connect(SimbricksPciState *simbricks, Error **errp)
     pci_config_set_revision(pci_conf, d_i->pci_revision);
     pci_config_set_class(pci_conf,
             ((uint16_t) d_i->pci_class << 8) | d_i->pci_subclass);
+    pci_config_set_prog_interface(pci_conf, d_i->pci_progif);
 
     return 1;
 }
