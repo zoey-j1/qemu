@@ -251,6 +251,10 @@ static void simbricks_comm_d2h_interrupt(SimbricksPciState *simbricks,
             return;
         }
         msix_notify(&simbricks->pdev, interrupt->vector);
+    } else if (interrupt->inttype == SIMBRICKS_PROTO_PCIE_INT_LEGACY_HI) {
+        pci_irq_assert(&simbricks->pdev);
+    } else if (interrupt->inttype == SIMBRICKS_PROTO_PCIE_INT_LEGACY_LO) {
+        pci_irq_deassert(&simbricks->pdev);
     } else {
         warn_report("simbricks_comm_d2h_interrupt: not yet implented int type "
                     "(%u) TODO", interrupt->inttype);
