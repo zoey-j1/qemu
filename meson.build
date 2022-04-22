@@ -402,6 +402,11 @@ if targetos == 'linux' and (have_system or have_tools)
                        required: get_option('libudev'),
                        static: enable_static)
 endif
+libsimbricks = not_found
+if 'CONFIG_LIBSIMBRICKS' in config_host
+  libsimbricks = declare_dependency(compile_args: config_host['LIBSIMBRICKS_CFLAGS'].split(),
+                                    link_args: config_host['LIBSIMBRICKS_LIBS'].split())
+endif
 
 mpathlibs = [libudev]
 mpathpersist = not_found
@@ -897,6 +902,7 @@ kconfig_external_symbols = [
   'CONFIG_VIRTFS',
   'CONFIG_LINUX',
   'CONFIG_PVRDMA',
+  'CONFIG_LIBSIMBRICKS',
 ]
 ignored = [ 'TARGET_XML_FILES', 'TARGET_ABI_DIR', 'TARGET_ARCH' ]
 
@@ -2124,6 +2130,7 @@ summary_info += {'madvise':           config_host.has_key('CONFIG_MADVISE')}
 summary_info += {'posix_madvise':     config_host.has_key('CONFIG_POSIX_MADVISE')}
 summary_info += {'posix_memalign':    config_host.has_key('CONFIG_POSIX_MEMALIGN')}
 summary_info += {'libcap-ng support': config_host.has_key('CONFIG_LIBCAP_NG')}
+summary_info += {'simbricks support': config_host.has_key('CONFIG_LIBSIMBRICKS')}
 summary_info += {'vhost-kernel support': config_host.has_key('CONFIG_VHOST_KERNEL')}
 summary_info += {'vhost-net support': config_host.has_key('CONFIG_VHOST_NET')}
 summary_info += {'vhost-crypto support': config_host.has_key('CONFIG_VHOST_CRYPTO')}

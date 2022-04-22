@@ -38,7 +38,8 @@ config EDU
 
 config SIMBRICKS_PCI
     bool
-    depends on PCI && MSI_NONBROKEN
+    default y if LIBSIMBRICKS
+    depends on PCI && MSI_NONBROKEN && LIBSIMBRICKS
 
 config PCA9552
     bool

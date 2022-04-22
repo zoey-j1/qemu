@@ -319,6 +319,7 @@ xen_pci_passthrough="auto"
 linux_aio=""
 linux_io_uring=""
 cap_ng=""
+simbricks=""
 attr=""
 libattr=""
 xfs=""
@@ -1114,6 +1115,10 @@ for opt do
   --disable-cap-ng)  cap_ng="no"
   ;;
   --enable-cap-ng) cap_ng="yes"
+  ;;
+  --disable-simbricks)  simbricks="no"
+  ;;
+  --enable-simbricks) simbricks="yes"
   ;;
   --disable-tcg) tcg="disabled"
   ;;
@@ -3331,6 +3336,29 @@ EOF
       feature_not_found "cap_ng" "Install libcap-ng devel"
     fi
     cap_ng=no
+  fi
+fi
+
+##########################################
+# simbricks library probe
+if test "$simbricks" != "no" ; then
+  simbricks_libs="-lsimbricks"
+  cat > $TMPC << EOF
+#include <simbricks/base/if.h>
+int main(void)
+{
+    struct SimbricksBaseIfParams params;
+    SimbricksBaseIfDefaultParams(&params);
+    return 0;
+}
+EOF
+  if compile_prog "" "$simbricks_libs" ; then
+    simbricks=yes
+  else
+    if test "$simbricks" = "yes" ; then
+      feature_not_found "simbricks" "Install libsimbricks devel"
+    fi
+    simbricks=no
   fi
 fi
 
@@ -6018,6 +6046,11 @@ fi
 if test "$cap_ng" = "yes" ; then
   echo "CONFIG_LIBCAP_NG=y" >> $config_host_mak
   echo "LIBCAP_NG_LIBS=$cap_libs" >> $config_host_mak
+fi
+if test "$simbricks" = "yes" ; then
+  echo "CONFIG_LIBSIMBRICKS=y" >> $config_host_mak
+  echo "LIBSIMBRICKS_LIBS=$simbricks_libs" >> $config_host_mak
+  echo "LIBSIMBRICKS_CFLAGS=$simbricks_cflags" >> $config_host_mak
 fi
 echo "CONFIG_AUDIO_DRIVERS=$audio_drv_list" >> $config_host_mak
 for drv in $audio_drv_list; do
