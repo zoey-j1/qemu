@@ -1,8 +1,8 @@
 /*
  * Co-simulation PCI device
  *
- * Copyright (c) 2020 Max Planck Institute for Software Systems
- * Copyright (c) 2020 National University of Singapore
+ * Copyright (c) 2020-2022 Max Planck Institute for Software Systems
+ * Copyright (c) 2020-2022 National University of Singapore
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
  * copy of this software and associated documentation files (the "Software"),
@@ -40,8 +40,7 @@
 #include "sysemu/cpus.h"
 #include "hw/core/cpu.h"
 
-#include <simbricks/proto/base.h>
-#include <simbricks/proto/pcie.h>
+#include <simbricks/pcie/if.h>
 
 //#define DEBUG_PRINTS
 
@@ -69,36 +68,24 @@ typedef struct SimbricksPciRequest {
     bool requested;
 } SimbricksPciRequest;
 
-#define SYNC_MODES   0
-#define SYNC_BARRIER 1
-
 typedef struct SimbricksPciState {
     PCIDevice pdev;
 
     QemuThread thread;
     volatile bool stopping;
 
-    CharBackend sim_chr;
+    /* config parameters */
+    char *socket_path;      /* path to ux socket to connect to */
+    uint64_t pci_latency;
+    uint64_t sync_period;
 
     MemoryRegion mmio_bars[6];
     SimbricksPciBarInfo bar_info[6];
 
+    struct SimbricksPcieIf pcieif;
     struct SimbricksProtoPcieDevIntro dev_intro;
 
-    void *shm_base;
-    size_t shm_len;
-
-    /* dev to host queue (managed by worker thread) */
-    uint8_t *d2h_base;
-    size_t d2h_nentries;
-    size_t d2h_elen;
-    size_t d2h_pos;
-
-    /* host to dev queue (managed by worker thread) */
-    uint8_t *h2d_base;
-    size_t h2d_nentries;
-    size_t h2d_elen;
-    size_t h2d_pos;
+    bool sync_ts_bumped;
 
     /* communication bewteen main io thread and worker thread
      * (protected by thr_mutex). */
@@ -108,15 +95,10 @@ typedef struct SimbricksPciState {
     /* timers for synchronization etc. */
     bool sync;
     int sync_mode;
-    uint64_t pci_latency;
-    uint64_t sync_period;
     int64_t ts_base;
     QEMUTimer *timer_dummy;
     QEMUTimer *timer_sync;
-    int64_t sync_ts;
-    bool sync_ts_bumped;
     QEMUTimer *timer_poll;
-    int64_t poll_ts;
 } SimbricksPciState;
 
 void QEMU_NORETURN cpu_loop_exit(CPUState *cpu);
@@ -146,46 +128,21 @@ static inline int64_t ts_from_proto(SimbricksPciState *simbricks,
     return (proto_ts / 1000) + simbricks->ts_base;
 }
 
-/******************************************************************************/
-/* Worker thread */
-
-static volatile union SimbricksProtoPcieH2D *simbricks_comm_h2d_alloc(
-        SimbricksPciState *simbricks, int64_t ts)
+static inline volatile union SimbricksProtoPcieH2D *simbricks_comm_h2d_alloc(
+        SimbricksPciState *simbricks,
+        uint64_t ts)
 {
-    uint8_t *pos;
     volatile union SimbricksProtoPcieH2D *msg;
+    while (!(msg = SimbricksPcieIfH2DOutAlloc(&simbricks->pcieif,
+                                              ts_to_proto(simbricks, ts))));
 
-    pos = simbricks->h2d_base + (simbricks->h2d_elen * simbricks->h2d_pos);
-    msg = (volatile union SimbricksProtoPcieH2D *) pos;
-
-    while ((msg->dummy.own_type & SIMBRICKS_PROTO_PCIE_H2D_OWN_MASK) !=
-            SIMBRICKS_PROTO_PCIE_H2D_OWN_HOST)
-    {
-#ifdef DEBUG_PRINTS
-        warn_report("simbricks_comm_h2d_alloc: ran into non-owned entry in h2d"
-                    " queue");
-#endif
-    }
-
-    /* tag message with timestamp */
-    msg->dummy.timestamp = ts_to_proto(simbricks, ts + simbricks->pci_latency);
-
-    /* re-arm sync timer */
-    if (simbricks->sync_mode == SIMBRICKS_PROTO_SYNC_SIMBRICKS) {
-        simbricks->sync_ts = ts + simbricks->sync_period;
-        simbricks->sync_ts_bumped = true;
-    }
-
-#ifdef DEBUG_PRINTS
-    warn_report("simbricks_comm_h2d_alloc: ts=%lu msg_ts=%lu next=%ld", ts,
-            msg->dummy.timestamp, ts + simbricks->sync_period);
-#endif
-
-    /* advance position to next entry */
-    simbricks->h2d_pos = (simbricks->h2d_pos + 1) % simbricks->h2d_nentries;
-
+    // whenever we send a message, we need to reschedule our sync timer
+    simbricks->sync_ts_bumped = true;
     return msg;
 }
+
+/******************************************************************************/
+/* Worker thread */
 
 static void simbricks_comm_d2h_dma_read(
         SimbricksPciState *simbricks,
@@ -199,16 +156,16 @@ static void simbricks_comm_d2h_dma_read(
     h2d = simbricks_comm_h2d_alloc(simbricks, ts);
     rc = &h2d->readcomp;
 
-    assert(read->len <= simbricks->h2d_elen - sizeof (*rc));
+    assert(read->len <=
+        SimbricksPcieIfH2DOutMsgLen(&simbricks->pcieif) - sizeof (*rc));
 
     /* perform dma read */
     pci_dma_read(&simbricks->pdev, read->offset, (void *) rc->data, read->len);
 
     /* return completion */
     rc->req_id = read->req_id;
-    smp_wmb();
-    rc->own_type = SIMBRICKS_PROTO_PCIE_H2D_MSG_READCOMP |
-        SIMBRICKS_PROTO_PCIE_H2D_OWN_DEV;
+    SimbricksPcieIfH2DOutSend(&simbricks->pcieif, h2d,
+        SIMBRICKS_PROTO_PCIE_H2D_MSG_READCOMP);
 }
 
 static void simbricks_comm_d2h_dma_write(
@@ -229,9 +186,8 @@ static void simbricks_comm_d2h_dma_write(
 
     /* return completion */
     wc->req_id = write->req_id;
-    smp_wmb();
-    wc->own_type = SIMBRICKS_PROTO_PCIE_H2D_MSG_WRITECOMP |
-        SIMBRICKS_PROTO_PCIE_H2D_OWN_DEV;
+    SimbricksPcieIfH2DOutSend(&simbricks->pcieif, h2d,
+        SIMBRICKS_PROTO_PCIE_H2D_MSG_READCOMP);
 }
 
 static void simbricks_comm_d2h_interrupt(SimbricksPciState *simbricks,
@@ -304,13 +260,13 @@ static void simbricks_comm_d2h_process(
 {
     uint8_t type;
 
-    type = msg->dummy.own_type & SIMBRICKS_PROTO_PCIE_D2H_MSG_MASK;
+    type = SimbricksPcieIfD2HInType(&simbricks->pcieif, msg);
 #ifdef DEBUG_PRINTS
     warn_report("simbricks_comm_d2h_process: ts=%ld type=%u", ts, type);
 #endif
 
     switch (type) {
-        case SIMBRICKS_PROTO_PCIE_D2H_MSG_SYNC:
+        case SIMBRICKS_PROTO_MSG_TYPE_SYNC:
             /* nop */
             break;
 
@@ -339,72 +295,7 @@ static void simbricks_comm_d2h_process(
             panic("simbricks_comm_poll_d2h: unhandled type");
     }
 
-    smp_wmb();
-
-    /* mark message as done */
-    msg->dummy.own_type =
-        (msg->dummy.own_type & SIMBRICKS_PROTO_PCIE_D2H_MSG_MASK) |
-        SIMBRICKS_PROTO_PCIE_D2H_OWN_DEV;
-}
-
-/* peek at head of d2h queue */
-static int simbricks_comm_d2h_peek(
-        SimbricksPciState *simbricks,
-        int64_t ts,
-        int64_t *next_ts,
-        volatile union SimbricksProtoPcieD2H **pmsg)
-{
-    uint8_t *pos;
-    int64_t msg_ts;
-    volatile union SimbricksProtoPcieD2H *msg;
-
-    pos = simbricks->d2h_base + (simbricks->d2h_elen * simbricks->d2h_pos);
-    msg = (volatile union SimbricksProtoPcieD2H *) pos;
-
-    /* check if this message is ready for us */
-    if ((msg->dummy.own_type & SIMBRICKS_PROTO_PCIE_D2H_OWN_MASK) !=
-        SIMBRICKS_PROTO_PCIE_D2H_OWN_HOST)
-    {
-        return -1;
-    }
-
-    smp_rmb();
-
-    msg_ts = ts_from_proto(simbricks, msg->dummy.timestamp);
-
-    *pmsg = msg;
-    *next_ts = msg_ts;
-    if (simbricks->sync && msg_ts > ts) {
-        /* still in the future */
-        return 1;
-    }
-
-    return 0;
-}
-
-/* move on to next d2h queue position */
-static void simbricks_comm_d2h_next(SimbricksPciState *simbricks)
-{
-    /* advance position to next entry */
-    simbricks->d2h_pos = (simbricks->d2h_pos + 1) % simbricks->d2h_nentries;
-}
-
-static void simbricks_trigger_sync(SimbricksPciState *simbricks,
-                                   int64_t cur_ts)
-{
-    volatile union SimbricksProtoPcieH2D *msg;
-    volatile struct SimbricksProtoPcieH2DSync *sy;
-
-    msg = simbricks_comm_h2d_alloc(simbricks, cur_ts);
-    sy = &msg->sync;
-
-    smp_wmb(); /* barrier to make sure earlier fields are written before
-                  handing over ownership */
-
-    sy->own_type = SIMBRICKS_PROTO_PCIE_H2D_MSG_SYNC |
-                   SIMBRICKS_PROTO_PCIE_H2D_OWN_DEV;
-
-    /* simbricks_comm_h2d_alloc has already re-scheduled the timer */
+    SimbricksPcieIfD2HInDone(&simbricks->pcieif, msg);
 }
 
 static void simbricks_timer_dummy(void *data)
@@ -416,61 +307,48 @@ static void simbricks_timer_poll(void *data)
     SimbricksPciState *simbricks = data;
     volatile union SimbricksProtoPcieD2H *msg;
     volatile union SimbricksProtoPcieD2H *next_msg;
-    int64_t cur_ts, next_ts;
-    int ret;
+    int64_t cur_ts, next_ts, proto_ts;
 
     cur_ts = qemu_clock_get_ns(SIMBRICKS_CLOCK);
+    proto_ts = ts_to_proto(simbricks, cur_ts + 1); // + 1 to avoid getting stuck
+                                                   // on off by ones due to of
+                                                   // rounding
 #ifdef DEBUG_PRINTS
-    if (cur_ts > simbricks->poll_ts + 1 || cur_ts < simbricks->poll_ts)
+    uint64_t poll_ts = SimbricksPcieIfD2HInTimestamp(&simbricks->pcieif);
+    if (proto_ts > poll_ts + 1 || proto_ts < poll_ts)
         warn_report("simbricks_timer_poll: expected_ts=%lu cur_ts=%lu",
-                    simbricks->poll_ts, cur_ts);
-#endif
-
-    if (cur_ts > simbricks->sync_ts + 1) {
-#ifdef DEBUG_PRINTS
-        warn_report("simbricks_timer_poll: triggering sync: ts=%ld sync_ts=%ld",
-                    cur_ts, timer_expire_time_ns(simbricks->timer_sync));
-#endif
-        simbricks_trigger_sync(simbricks, cur_ts);
-    }
-
-#ifdef DEBUG_PRINTS
+                    poll_ts, cur_ts);
     warn_report("simbricks_timer_poll: ts=%ld sync_ts=%ld", cur_ts,
                 timer_expire_time_ns(simbricks->timer_sync));
 #endif
 
-    /* poll until we have a message */
+    /* poll until we have a message (should not usually spin) */
     do {
-        ret = simbricks_comm_d2h_peek(simbricks, cur_ts, &next_ts, &msg);
-    } while (ret < 0);
+        msg = SimbricksPcieIfD2HInPoll(&simbricks->pcieif, proto_ts);
+    } while (msg == NULL);
 
-    if (ret == 0) {
-        /* message is ready to be processed */
-        simbricks_comm_d2h_next(simbricks);
-
-        /* now poll until we have next message so we know the timestamp */
-        while (simbricks_comm_d2h_peek(simbricks, cur_ts, &next_ts, &next_msg)
-               < 0);
-    } else {
-        next_msg = msg;
-    }
+    /* wait for next message so we know its timestamp and when to schedule the
+     * timer. */
+    do {
+        next_msg = SimbricksPcieIfD2HInPeek(&simbricks->pcieif, proto_ts);
+        next_ts = SimbricksPcieIfD2HInTimestamp(&simbricks->pcieif);
+    } while (!next_msg && next_ts <= proto_ts);
 
     /* set timer for next message */
     /* we need to do this before actually processing the message, in order to
      * have a timer set to prevent the clock from running away from us. We set a
      * dummy timer with the current ts to prevent the clock from jumping */
     timer_mod_ns(simbricks->timer_dummy, cur_ts);
-    timer_mod_ns(simbricks->timer_poll, next_ts);
+    timer_mod_ns(simbricks->timer_poll, ts_from_proto(simbricks, next_ts));
     if (simbricks->sync_ts_bumped) {
-        timer_mod_ns(simbricks->timer_sync, simbricks->sync_ts);
+        timer_mod_ns(simbricks->timer_sync,
+            ts_from_proto(simbricks,
+                SimbricksBaseIfOutNextSync(&simbricks->pcieif.base)));
         simbricks->sync_ts_bumped = false;
     }
-    simbricks->poll_ts = next_ts;
 
-    /* run */
-    if (ret == 0) {
-        simbricks_comm_d2h_process(simbricks, cur_ts, msg);
-    }
+    /* now process the message */
+    simbricks_comm_d2h_process(simbricks, cur_ts, msg);
 
 #ifdef DEBUG_PRINTS
     int64_t now_ts = qemu_clock_get_ns(SIMBRICKS_CLOCK);
@@ -486,18 +364,22 @@ static void simbricks_timer_sync(void *data)
 {
     SimbricksPciState *simbricks = data;
     int64_t cur_ts;
+    uint64_t proto_ts;
 
     cur_ts = qemu_clock_get_ns(SIMBRICKS_CLOCK);
+    proto_ts = ts_to_proto(simbricks, cur_ts);
 
 #ifdef DEBUG_PRINTS
-    if (cur_ts > simbricks->sync_ts + 1)
+    uint64_t sync_ts = SimbricksPcieIfH2DOutNextSync(&simbricks->pcieif);
+    if (proto_ts > sync_ts + 1)
         warn_report("simbricks_timer_sync: expected_ts=%lu cur_ts=%lu",
-                    simbricks->sync_ts, cur_ts);
+                    sync_ts, proto_ts);
 
-    warn_report("simbricks_timer_sync: ts=%ld", cur_ts);
+    warn_report("simbricks_timer_sync: ts=%lu pts=%lu npts=%lu", cur_ts,
+            proto_ts, sync_ts);
 #endif
 
-    simbricks_trigger_sync(simbricks, cur_ts);
+    while (SimbricksPcieIfH2DOutSync(&simbricks->pcieif, proto_ts));
 
 #ifdef DEBUG_PRINTS
     int64_t now_ts = qemu_clock_get_ns(SIMBRICKS_CLOCK);
@@ -505,31 +387,26 @@ static void simbricks_timer_sync(void *data)
         warn_report("simbricks_timer_poll: time advanced from %lu to %lu",
                     cur_ts, now_ts);
 #endif
-
-    if (simbricks->sync_mode == SIMBRICKS_PROTO_SYNC_BARRIER) {
-        simbricks->sync_ts = cur_ts + simbricks->sync_period;
-        simbricks->sync_ts_bumped = true;
-    }
-    assert(simbricks->sync_ts_bumped);
-    timer_mod_ns(simbricks->timer_sync, simbricks->sync_ts);
-    simbricks->sync_ts_bumped = false;
+    uint64_t next_sync_pts = SimbricksPcieIfH2DOutNextSync(&simbricks->pcieif);
+    uint64_t next_sync_ts = ts_from_proto(simbricks, next_sync_pts);
+#ifdef DEBUG_PRINTS
+    warn_report("simbricks_timer_sync: next pts=%lu ts=%lu", next_sync_pts,
+        next_sync_ts);
+#endif
+    timer_mod_ns(simbricks->timer_sync, next_sync_ts);
 }
 
 static void *simbricks_poll_thread(void *opaque)
 {
     SimbricksPciState *simbricks = opaque;
     volatile union SimbricksProtoPcieD2H *msg;
-    int64_t next_ts;
-    int ret;
 
     assert(!simbricks->sync);
 
     while (!simbricks->stopping) {
-        ret = simbricks_comm_d2h_peek(simbricks, 0, &next_ts, &msg);
-        if (ret)
+        msg = SimbricksPcieIfD2HInPoll(&simbricks->pcieif, 0);
+        if (!msg)
             continue;
-
-        simbricks_comm_d2h_next(simbricks);
 
         /* actually process the operation. this needs to be done with the I/O
          * lock held. */
@@ -605,15 +482,13 @@ static void simbricks_mmio_rw(SimbricksPciState *simbricks,
         write->len = size;
         write->bar = bar;
 
-        assert(size <= simbricks->h2d_elen - sizeof (*write));
+        assert(size <=
+            SimbricksPcieIfH2DOutMsgLen(&simbricks->pcieif) - sizeof (*write));
         /* FIXME: this probably only works for LE */
         memcpy((void *) write->data, val, size);
 
-        smp_wmb(); /* barrier to make sure earlier fields are written before
-                      handing over ownership */
-
-        write->own_type = SIMBRICKS_PROTO_PCIE_H2D_MSG_WRITE |
-            SIMBRICKS_PROTO_PCIE_H2D_OWN_DEV;
+        SimbricksPcieIfH2DOutSend(&simbricks->pcieif, msg,
+            SIMBRICKS_PROTO_PCIE_H2D_MSG_WRITE);
 
 #ifdef DEBUG_PRINTS
         warn_report("simbricks_mmio_rw: finished write (%lu) addr=%lx size=%x "
@@ -630,11 +505,8 @@ static void simbricks_mmio_rw(SimbricksPciState *simbricks,
         read->len = size;
         read->bar = bar;
 
-        smp_wmb(); /* barrier to make sure earlier fields are written before
-                      handing over ownership */
-
-        read->own_type = SIMBRICKS_PROTO_PCIE_H2D_MSG_READ |
-            SIMBRICKS_PROTO_PCIE_H2D_OWN_DEV;
+        SimbricksPcieIfH2DOutSend(&simbricks->pcieif, msg,
+            SIMBRICKS_PROTO_PCIE_H2D_MSG_READ);
 
         /* start processing request */
         req->processing = true;
@@ -737,11 +609,8 @@ static void simbricks_config_write(PCIDevice *dev,
         if (msix_after)
             devctrl->flags |= SIMBRICKS_PROTO_PCIE_CTRL_MSIX_EN;
 
-        smp_wmb(); /* barrier to make sure earlier fields are written before
-                      handing over ownership */
-
-        devctrl->own_type = SIMBRICKS_PROTO_PCIE_H2D_MSG_DEVCTRL |
-            SIMBRICKS_PROTO_PCIE_H2D_OWN_DEV;
+        SimbricksPcieIfH2DOutSend(&simbricks->pcieif, msg,
+            SIMBRICKS_PROTO_PCIE_H2D_MSG_DEVCTRL);
     }
 }
 
@@ -753,102 +622,75 @@ static int simbricks_connect(SimbricksPciState *simbricks, Error **errp)
 {
     struct SimbricksProtoPcieDevIntro *d_i = &simbricks->dev_intro;
     struct SimbricksProtoPcieHostIntro host_intro;
-    struct stat statbuf;
-    int ret, off, len;
+    struct SimbricksBaseIfParams params;
+    size_t len;
     CPUState *cpu;
-    void *p;
     uint8_t *pci_conf = simbricks->pdev.config;
+    uint64_t first_sync_ts = 0, first_msg_ts = 0;
+    volatile union SimbricksProtoPcieD2H *msg;
+    struct SimbricksBaseIf *base_if = &simbricks->pcieif.base;
 
-    if (!qemu_chr_fe_backend_connected(&simbricks->sim_chr)) {
-        error_setg(errp, "no simulator chardev specified");
+    if (!simbricks->socket_path) {
+        error_setg(errp, "socket path not set but required");
         return 0;
     }
 
-    /* send host intro */
-    memset(&host_intro, 0, sizeof(host_intro));
+    SimbricksPcieIfDefaultParams(&params);
+    params.link_latency = simbricks->pci_latency * 1000;
+    params.sync_interval = simbricks->sync_period * 1000;
+    params.blocking_conn = true;
+    params.sock_path = simbricks->socket_path;
+    params.sync_mode = (simbricks->sync ? kSimbricksBaseIfSyncRequired :
+        kSimbricksBaseIfSyncDisabled);
 
-    if (simbricks->sync)
-        host_intro.flags = SIMBRICKS_PROTO_PCIE_FLAGS_HI_SYNC;
-
-    len = sizeof(host_intro);
-    off = 0;
-    while (off < len) {
-        ret = qemu_chr_fe_write_all(&simbricks->sim_chr,
-                ((uint8_t *) &host_intro) + off, len - off);
-        if (ret <= 0) {
-            if (ret == -EINTR) {
-                continue;
-            }
-            error_setg(errp, "simbricks_connect: sending host intro failed");
-            return 0;
-        }
-
-        off += ret;
+    if (SimbricksBaseIfInit(base_if, &params)) {
+        error_setg(errp, "SimbricksBaseIfInit failed");
+        return 0;
     }
 
+    if (SimbricksBaseIfConnect(base_if)) {
+        error_setg(errp, "SimbricksBaseIfConnect failed");
+        return 0;
+    }
+
+    if (SimbricksBaseIfConnected(base_if)) {
+        error_setg(errp, "SimbricksBaseIfConnected indicates unconnected");
+        return 0;
+    }
+
+    /* prepare & send host intro */
+    memset(&host_intro, 0, sizeof(host_intro));
+    if (SimbricksBaseIfIntroSend(base_if, &host_intro,
+                                 sizeof(host_intro))) {
+        error_setg(errp, "SimbricksBaseIfIntroSend failed");
+        return 0;
+    }
 
     /* receive device intro */
     len = sizeof(*d_i);
-    off = 0;
-    while (off < len) {
-        ret = qemu_chr_fe_read_all(&simbricks->sim_chr,
-                ((uint8_t *) d_i) + off, len - off);
-        if (ret <= 0) {
-            if (ret == -EINTR) {
-                continue;
-            }
-            error_setg(errp, "simbricks_connect: receiving dev intro failed");
-            return 0;
-        }
-        off += ret;
-
+    if (SimbricksBaseIfIntroRecv(base_if, d_i, &len)) {
+        error_setg(errp, "SimbricksBaseIfIntroRecv failed");
+        return 0;
+    }
+    if (len != sizeof(*d_i)) {
+        error_setg(errp, "rx dev intro: length is not as expected");
+        return 0;
     }
 
     if (simbricks->sync) {
-        if (!(d_i->flags & SIMBRICKS_PROTO_PCIE_FLAGS_DI_SYNC)) {
-            error_setg(errp, "simbricks_connect: sync not reciprocated");
+        /* send a first sync */
+        if (SimbricksPcieIfH2DOutSync(&simbricks->pcieif, 0)) {
+            error_setg(errp, "sending initial sync failed");
             return 0;
         }
+        first_sync_ts = SimbricksPcieIfH2DOutNextSync(&simbricks->pcieif);
+
+        /* wait for first message so we know its timestamp */
+        do {
+            msg = SimbricksPcieIfD2HInPeek(&simbricks->pcieif, 0);
+            first_msg_ts = SimbricksPcieIfD2HInTimestamp(&simbricks->pcieif);
+        } while (!msg && !first_msg_ts);
     }
-
-    /* get shared memory fd */
-    ret = qemu_chr_fe_get_msgfd(&simbricks->sim_chr);
-    if (ret < 0) {
-        error_setg(errp, "simbricks_connect: receiving shm fd failed");
-        return 0;
-    }
-
-    /* receive and validate lengths and offsets */
-    if (fstat(ret, &statbuf) != 0) {
-        error_setg_errno(errp, errno, "simbricks_connect: fstat failed");
-        close(ret);
-        return 0;
-    }
-    simbricks->shm_len = statbuf.st_size;
-
-    /* TODO: validate queue offsets and lengths */
-
-    /* mmap shared memory fd */
-    p = mmap(NULL, simbricks->shm_len, PROT_READ | PROT_WRITE, MAP_SHARED, ret,
-             0);
-    close(ret);
-    if (p == MAP_FAILED) {
-        error_setg_errno(errp, errno, "simbricks_connect: mmap failed");
-        return 0;
-    }
-    simbricks->shm_base = p;
-
-    /* setup queues */
-    simbricks->d2h_base = (uint8_t *) simbricks->shm_base + d_i->d2h_offset;
-    simbricks->d2h_elen = d_i->d2h_elen;
-    simbricks->d2h_nentries = d_i->d2h_nentries;
-    simbricks->d2h_pos = 0;
-
-    simbricks->h2d_base = (uint8_t *) simbricks->shm_base + d_i->h2d_offset;
-    simbricks->h2d_elen = d_i->h2d_elen;
-    simbricks->h2d_nentries = d_i->h2d_nentries;
-    simbricks->h2d_pos = 0;
-
     simbricks->reqs_len = 0;
     CPU_FOREACH(cpu) {
         simbricks->reqs_len++;
@@ -866,12 +708,12 @@ static int simbricks_connect(SimbricksPciState *simbricks, Error **errp)
         simbricks->ts_base = qemu_clock_get_ns(SIMBRICKS_CLOCK);
         simbricks->timer_sync =
             timer_new_ns(SIMBRICKS_CLOCK, simbricks_timer_sync, simbricks);
-        simbricks->sync_ts = simbricks->ts_base;
-        timer_mod_ns(simbricks->timer_sync, simbricks->ts_base);
-        simbricks->poll_ts = simbricks->ts_base + 1;
+        timer_mod_ns(simbricks->timer_sync,
+            ts_from_proto(simbricks, first_sync_ts));
         simbricks->timer_poll =
             timer_new_ns(SIMBRICKS_CLOCK, simbricks_timer_poll, simbricks);
-        timer_mod_ns(simbricks->timer_poll, simbricks->ts_base + 1);
+        timer_mod_ns(simbricks->timer_poll,
+            ts_from_proto(simbricks, first_msg_ts));
     } else {
         qemu_thread_create(&simbricks->thread, "simbricks-poll",
                 simbricks_poll_thread, simbricks, QEMU_THREAD_JOINABLE);
@@ -1001,6 +843,8 @@ static void pci_simbricks_uninit(PCIDevice *pdev)
 
     if (simbricks->dev_intro.pci_msi_nvecs > 0)
         msi_uninit(pdev);
+
+    SimbricksBaseIfClose(&simbricks->pcieif.base);
 }
 
 static void simbricks_pci_instance_init(Object *obj)
@@ -1008,7 +852,7 @@ static void simbricks_pci_instance_init(Object *obj)
 }
 
 static Property simbricks_pci_dev_properties[] = {
-  DEFINE_PROP_CHR("chardev", SimbricksPciState, sim_chr),
+  DEFINE_PROP_STRING("socket", SimbricksPciState, socket_path),
   DEFINE_PROP_BOOL("sync", SimbricksPciState, sync, false),
   DEFINE_PROP_INT32("sync-mode", SimbricksPciState, sync_mode,
       SIMBRICKS_PROTO_SYNC_SIMBRICKS),
