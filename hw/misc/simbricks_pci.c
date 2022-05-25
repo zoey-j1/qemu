@@ -187,7 +187,7 @@ static void simbricks_comm_d2h_dma_write(
     /* return completion */
     wc->req_id = write->req_id;
     SimbricksPcieIfH2DOutSend(&simbricks->pcieif, h2d,
-        SIMBRICKS_PROTO_PCIE_H2D_MSG_READCOMP);
+        SIMBRICKS_PROTO_PCIE_H2D_MSG_WRITECOMP);
 }
 
 static void simbricks_comm_d2h_interrupt(SimbricksPciState *simbricks,
