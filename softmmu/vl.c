@@ -4544,5 +4544,9 @@ void qemu_cleanup(void)
     monitor_cleanup();
     qemu_chr_cleanup();
     user_creatable_cleanup();
+#ifdef CONFIG_SIMBRICKS_PCI
+    extern void simbricks_cleanup(void);
+    simbricks_cleanup();
+#endif
     /* TODO: unref root container, check all devices are ok */
 }

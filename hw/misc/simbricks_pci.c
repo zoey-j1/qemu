@@ -99,7 +99,12 @@ typedef struct SimbricksPciState {
     QEMUTimer *timer_dummy;
     QEMUTimer *timer_sync;
     QEMUTimer *timer_poll;
+
+    struct SimbricksPciState *next_simbricks;
 } SimbricksPciState;
+
+static SimbricksPciState *simbricks_all = NULL;
+void simbricks_cleanup(void);
 
 void QEMU_NORETURN cpu_loop_exit(CPUState *cpu);
 
@@ -815,6 +820,9 @@ static void pci_simbricks_realize(PCIDevice *pdev, Error **errp)
             }
         }
     }
+
+    simbricks->next_simbricks = simbricks_all;
+    simbricks_all = simbricks;
 }
 
 static void pci_simbricks_uninit(PCIDevice *pdev)
@@ -900,3 +908,10 @@ static void pci_simbricks_register_types(void)
     type_register_static(&simbricks_info);
 }
 type_init(pci_simbricks_register_types)
+
+void simbricks_cleanup(void)
+{
+    SimbricksPciState *sbs;
+    for (sbs = simbricks_all; sbs != NULL; sbs = sbs->next_simbricks)
+        pci_simbricks_uninit(&sbs->pdev);
+}
