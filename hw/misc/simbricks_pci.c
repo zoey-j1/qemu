@@ -164,13 +164,22 @@ static void simbricks_comm_d2h_dma_read(
     assert(read->len <=
         SimbricksPcieIfH2DOutMsgLen(&simbricks->pcieif) - sizeof (*rc));
 
+    fprintf(stderr, "qemu d2h simbricks_comm_d2h_dma_read offset %ld, len %d\n", read->offset, read->len);
+
     /* perform dma read */
     pci_dma_read(&simbricks->pdev, read->offset, (void *) rc->data, read->len);
 
+    uint64_t a = 123;
+    memcpy(rc->data, &a, sizeof(uint64_t));
+    fprintf(stderr, "data read %s\n", rc->data);
+
+    fprintf(stderr, "SimbricksPcieIfH2DOutSend start\n");
     /* return completion */
     rc->req_id = read->req_id;
     SimbricksPcieIfH2DOutSend(&simbricks->pcieif, h2d,
         SIMBRICKS_PROTO_PCIE_H2D_MSG_READCOMP);
+    fprintf(stderr, "SimbricksPcieIfH2DOutSend finish\n");
+
 }
 
 static void simbricks_comm_d2h_dma_write(
@@ -263,6 +272,7 @@ static void simbricks_comm_d2h_process(
         int64_t ts,
         volatile union SimbricksProtoPcieD2H *msg)
 {
+    fprintf(stderr, "simbricks_comm_d2h_process start\n");
     uint8_t type;
 
     type = SimbricksPcieIfD2HInType(&simbricks->pcieif, msg);
@@ -272,27 +282,33 @@ static void simbricks_comm_d2h_process(
 
     switch (type) {
         case SIMBRICKS_PROTO_MSG_TYPE_SYNC:
+            fprintf(stderr, "simbricks_comm_d2h_process case SIMBRICKS_PROTO_MSG_TYPE_SYNC\n");
             /* nop */
             break;
 
         case SIMBRICKS_PROTO_PCIE_D2H_MSG_READ:
+            fprintf(stderr, "simbricks_comm_d2h_process case SIMBRICKS_PROTO_PCIE_D2H_MSG_READ\n");
             simbricks_comm_d2h_dma_read(simbricks, ts, &msg->read);
             break;
 
         case SIMBRICKS_PROTO_PCIE_D2H_MSG_WRITE:
+            fprintf(stderr, "simbricks_comm_d2h_process case SIMBRICKS_PROTO_PCIE_D2H_MSG_WRITE\n");
             simbricks_comm_d2h_dma_write(simbricks, ts, &msg->write);
             break;
 
         case SIMBRICKS_PROTO_PCIE_D2H_MSG_INTERRUPT:
+            fprintf(stderr, "simbricks_comm_d2h_process case SIMBRICKS_PROTO_PCIE_D2H_MSG_INTERRUPT\n");
             simbricks_comm_d2h_interrupt(simbricks, &msg->interrupt);
             break;
 
         case SIMBRICKS_PROTO_PCIE_D2H_MSG_READCOMP:
+            fprintf(stderr, "simbricks_comm_d2h_process case SIMBRICKS_PROTO_PCIE_D2H_MSG_READCOMP\n");
             simbricks_comm_d2h_rcomp(simbricks, ts, msg->readcomp.req_id,
                     (void *) msg->readcomp.data);
             break;
 
         case SIMBRICKS_PROTO_PCIE_D2H_MSG_WRITECOMP:
+            fprintf(stderr, "simbricks_comm_d2h_process case SIMBRICKS_PROTO_PCIE_D2H_MSG_WRITECOMP\n");
             /* we treat writes as posted, so nothing we need to do here */
             break;
 
@@ -300,7 +316,9 @@ static void simbricks_comm_d2h_process(
             panic("simbricks_comm_poll_d2h: unhandled type");
     }
 
+    fprintf(stderr, "SimbricksPcieIfD2HInDone start\n");
     SimbricksPcieIfD2HInDone(&simbricks->pcieif, msg);
+    fprintf(stderr, "SimbricksPcieIfD2HInDone finish\n");
 }
 
 static void simbricks_timer_dummy(void *data)
@@ -332,12 +350,16 @@ static void simbricks_timer_poll(void *data)
         msg = SimbricksPcieIfD2HInPoll(&simbricks->pcieif, proto_ts);
     } while (msg == NULL);
 
+    fprintf(stderr, "simbricks_timer_poll received message\n");
+
     /* wait for next message so we know its timestamp and when to schedule the
      * timer. */
     do {
         next_msg = SimbricksPcieIfD2HInPeek(&simbricks->pcieif, proto_ts);
         next_ts = SimbricksPcieIfD2HInTimestamp(&simbricks->pcieif);
     } while (!next_msg && next_ts <= proto_ts);
+
+    fprintf(stderr, "simbricks_timer_poll got timestamp\n");
 
     /* set timer for next message */
     /* we need to do this before actually processing the message, in order to
@@ -352,8 +374,12 @@ static void simbricks_timer_poll(void *data)
         simbricks->sync_ts_bumped = false;
     }
 
+    fprintf(stderr, "simbricks_timer_poll call simbricks_comm_d2h_process\n");
+
     /* now process the message */
     simbricks_comm_d2h_process(simbricks, cur_ts, msg);
+
+    fprintf(stderr, "simbricks_timer_poll simbricks_comm_d2h_process finished\n\n");
 
 #ifdef DEBUG_PRINTS
     int64_t now_ts = qemu_clock_get_ns(SIMBRICKS_CLOCK);
